@@ -152,15 +152,21 @@ enum AudioFrameBuilder {
         var data = header.serialize()
         data.reserveCapacity(KaraokeProtocol.headerSize + payloadLength)
 
-        // Float → Int16，vDSP 带饱和截断（超出范围夹到 ±32767，不回绕）
+        // Float → Int16（PCM S16LE）
+        //
+        // ★ 之前这里写的是 vDSP_vclip —— 那个函数签名是
+        //   (const Float* 输入, ..., const Float* 下限, const Float* 上限, Float* 输出, ...)
+        //   输入输出都必须是 Float，用它写进 [Int16] 是类型错误。
+        //   正确做法是 vDSP_vfixu：专用于 Float 数组 → Int16 数组，
+        //   超出范围的样本自动饱和钳位（不回绕），这正是我们要的行为。
         var int16Buffer = [Int16](repeating: 0, count: frameCount)
-        var scale = Float(Int16.max)
 
         samples.withUnsafeBufferPointer { src in
-            guard let base = src.baseAddress else { return }
-            vDSP_vclip(base, 1, &scale,
-                       &kNegativeFullScale, &kPositiveFullScale,
-                       &int16Buffer, 1, vDSP_Length(frameCount))
+            int16Buffer.withUnsafeMutableBufferPointer { dst in
+                guard let srcBase = src.baseAddress,
+                      let dstBase = dst.baseAddress else { return }
+                vDSP_vfixu(srcBase, 1, dstBase, 1, vDSP_Length(frameCount))
+            }
         }
 
         int16Buffer.withUnsafeBufferPointer { src in

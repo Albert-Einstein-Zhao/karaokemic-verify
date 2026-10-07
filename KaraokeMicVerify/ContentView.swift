@@ -33,7 +33,7 @@ struct ContentView: View {
                     ipSection
 
                     // ── 关键指标 ──
-                    if vm.network.state == .ready {
+                    if vm.isNetworkReady {
                         metricsSection
                         waveformSection
                         controlsSection
@@ -44,11 +44,6 @@ struct ContentView: View {
                     Spacer(minLength: 20)
                 }
                 .padding(20)
-            }
-        }
-        .onAppear {
-            vm.audio.onStateChange = { [weak self] _ in
-                self?.objectWillChange.send()
             }
         }
     }
@@ -102,13 +97,15 @@ struct ContentView: View {
     private var statusRow: some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(vm.statusColor)
+                .fill(vm.isNetworkReady ? Color.green : Color.orange)
                 .frame(width: 9, height: 9)
-            Text(vm.network.state.text)
+            // 用 ViewModel 镜像出来的状态（@Published），不用 vm.network.state
+            // —— network 是 let 常量，它变了不会通知 SwiftUI 刷新
+            Text(vm.networkStatusText)
                 .font(.system(size: 13))
                 .foregroundStyle(.gray)
-            if !vm.network.deviceName.isEmpty {
-                Text("· 设备：\(vm.network.deviceName)")
+            if !vm.deviceName.isEmpty {
+                Text("· 设备：\(vm.deviceName)")
                     .font(.system(size: 13))
                     .foregroundStyle(.gray)
             }

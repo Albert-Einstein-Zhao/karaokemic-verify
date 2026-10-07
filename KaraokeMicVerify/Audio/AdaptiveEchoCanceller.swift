@@ -119,15 +119,40 @@ final class AdaptiveEchoCanceller {
             return erleDb
         }
 
-        // ── 1. 预测回声：y[n] = Σ h[n-k] · x[k] ──
-        // 用 vDSP_dotpr 做滑动相关，比手写循环快 5-10 倍
+        // ── 1. 预测回声：y[i] = Σ h[k] · reference[i - k] ──
+        //
+        // ★ 这里原来写的是 vDSP_dotpr —— 那是「点积」函数，
+        //   返回一个标量（Float），不能用来生成逐点预测序列。
+        //
+        // 也考虑过改用 vDSP_conv（真正的卷积函数），但它有两个硬约束：
+        //   ① 输入信号长度必须 ≥ lenResult + lenFilter - 1，即需要零填充
+        //   ② 每次调用都要构造填充后的临时数组
+        // 在 5ms 一帧的实时音频回调里，第②条是禁忌（堆分配会造���爆音）。
+        //
+        // 所以用标量循环。开销核算：
+        //   240 样本 × 512 taps ≈ 12.3 万次乘加，每 5ms 执行一次
+        //   ≈ 24.6 M 次乘加/秒，A13 及以后单核占用约 2.5%，完全可接受。
         var yEstimate = [Float](repeating: 0, count: n)
-        vDSP_dotpr(reference, 1, h, 1, &yEstimate, 1, vDSP_Length(n))
+        for i in 0..<n {
+            var acc: Float = 0
+            // h[k] 对应参考信号里往前数第 k 个样本
+            let upper = min(taps, i + 1)
+            for k in 0..<upper {
+                acc += h[k] * reference[i - k]
+            }
+            yEstimate[i] = acc
+        }
 
         // ── 2. 误差信号：e[n] = mic[n] - yEstimate[n] ──
         // 这个 e 就是「减去回声后的干净人声」
         var err = [Float](repeating: 0, count: n)
-        vDSP_vsub(mic, 1, yEstimate, 1, &err, 1, vDSP_Length(n))
+        mic.withUnsafeMutableBufferPointer { m in
+            yEstimate.withUnsafeBufferPointer { y in
+                guard let mb = m.baseAddress, let yb = y.baseAddress else { return }
+                // vDSP_vsub只吃裸指针，不接受数组/切片
+                vDSP_vsub(mb, 1, yb, 1, mb, 1, vDSP_Length(n))
+            }
+        }
 
         // ── 3. 散度保护 ──
         // 如果残差远大于输入，说明滤波器完全发散了（比如突然插拔设备、
@@ -202,7 +227,11 @@ final class AdaptiveEchoCanceller {
     private func power(of sig: [Float]) -> Float {
         guard !sig.isEmpty else { return 0 }
         var sum: Float = 0
-        vDSP_svesq(sig, 1, &sum, vDSP_Length(sig.count))
+        // vDSP_svesq 只接受裸指针，不接受数组
+        sig.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_svesq(base, 1, &sum, vDSP_Length(sig.count))
+        }
         return sum / Float(sig.count)
     }
 

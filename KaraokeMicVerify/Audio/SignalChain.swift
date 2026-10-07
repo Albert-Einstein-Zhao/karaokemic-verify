@@ -160,11 +160,15 @@ final class SignalChain {
             highPass.process(&work)
         }
 
-        // ── 阶段 [2]：输入增益 ──
+        // ── 阶段[2]：输入增益 ──
         // dB 转线性幅度：gain = 10^(dB/20)
         let inputGain = pow(10, params.inputGainDb / 20)
         var gainScalar = inputGain
-        vDSP_vsmul(work, 1, &gainScalar, &work, 1, vDSP_Length(n))
+        // vDSP 只吃裸指针；原地相乘（输入输出同址）
+        work.withUnsafeMutableBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_vsmul(base, 1, &gainScalar, base, 1, vDSP_Length(n))
+        }
 
         let inputLevel = dbfs(work)
 
@@ -294,7 +298,11 @@ final class SignalChain {
     private func dbfs(_ signal: [Float]) -> Float {
         guard !signal.isEmpty else { return -120 }
         var rms: Float = 0
-        vDSP_rmsqv(signal, 1, &rms, vDSP_Length(signal.count))
+        // vDSP 只吃裸指针
+        signal.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_rmsqv(base, 1, &rms, vDSP_Length(signal.count))
+        }
         guard rms > 1e-10 else { return -120 }
         return 20 * log10(rms)
     }

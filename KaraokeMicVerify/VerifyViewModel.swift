@@ -16,6 +16,12 @@ final class VerifyViewModel: ObservableObject {
 
     @Published var boxIP: String = "192.168.1.5"
     @Published private(set) var isConnected = false
+    /// 网络状态镜像。`network` 是 let 常量，它内部变了不会通知 UI，
+    /// 所以必须在这里复制一份成 @Published，SwiftUI 才会在 ready 时切界面。
+    @Published private(set) var isNetworkReady = false
+    @Published private(set) var networkStatusText: String = "未连接"
+    /// 盒子名称（hello_ack 里带回来的），同样要镜像才能触发 UI 刷新
+    @Published private(set) var deviceName: String = ""
 
     let network: NetworkController
     let audio: AudioEngineController
@@ -54,38 +60,41 @@ final class VerifyViewModel: ObservableObject {
             .autoconnect()
             .sink { [weak self] _ in self?.syncFromAudio() }
             .store(in: &cancellables)
+
+        // 网络状态 → UI。用NetworkController 自带的 onStateChange 回调，
+        // 比轮询更准（连接成功的瞬间就能刷新界面）。
+        // 注意：回调发生在 NetworkConnection 的队列上，必须切回主线程。
+        net.onStateChange = { [weak self] state in
+            DispatchQueue.main.async {
+                self?.applyNetworkState(state)
+            }
+        }
+
+    private func applyNetworkState(_ state: NetworkController.State) {
+        isNetworkReady = (state == .ready)
+        networkStatusText = state.text
+
+        // 连接就绪 → 立刻启动音频采集（只启动一次）
+        if state == .ready && !isConnected {
+            startAudio()
+        }
     }
 
     // MARK: - 连接
 
     func connect(boxIP: String) {
-        // IP 变了要重建 NetworkController
-        if network.hostValue != boxIP {
-            // NetworkController 的 host 是 let，简化处理：断开后由用户重连
-            // （真要热切换，把 host 改成 var 或重建实例）
-        }
-
+        // NetworkController 的 host 是 let，改IP 需要重建实例。
+        // 验证版接受这个限制：换 IP 时先断开再连。
+        // （正式版会把 host 改成 var，或在这里重建 network 实例）
         network.connect()
-
-        // 等连接就绪后启动音频
-        let nc = network
-        var started = false
-        let check = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
-            .prefix(20)                                    // 最多等 4 秒
-            .sink { [weak self] _ in
-                guard let self else { return }
-                if nc.state == .ready && !started {
-                    started = true
-                    self.startAudio()
-                }
-            }
-        cancellables.insert(check)
     }
 
     func disconnect() {
         audio.stop()
         network.disconnect()
         isConnected = false
+        isNetworkReady = false
+        networkStatusText = NetworkController.State.idle.text
         sentFrames = 0
     }
 
@@ -112,6 +121,9 @@ final class VerifyViewModel: ObservableObject {
         isSinging = audio.isSinging
         sentFrames = audio.sentFrames
         levelHistory = audio.levelHistory
+        if deviceName != network.deviceName {
+            deviceName = network.deviceName
+        }
     }
 
     // MARK: - 参数

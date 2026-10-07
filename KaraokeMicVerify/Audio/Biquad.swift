@@ -26,14 +26,8 @@ struct BiquadCoeffs {
 
     static let passthrough = BiquadCoeffs(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0)
 
-    var biquad: BDSPair {
-        get { DSPConvert(signal: [b0, b1, b2, a1, a2]) }
-        set {
-            var arr = [Float](repeating: 0, count: 5)
-            vDSP_ctsm(setter(&arr), 2, newValue.reinterpretCast(), 2, vDSP_Length(5))
-            b0 = arr[0]; b1 = arr[1]; b2 = arr[2]; a1 = arr[3]; a2 = arr[4]
-        }
-    }
+    /// 按顺序取出 5 个系数，供需要喂给 vDSP 的场合使用。
+    var array: [Float] { [b0, b1, b2, a1, a2] }
 }
 
 /// 双二阶滤波器 —— 单样本处理状态机。

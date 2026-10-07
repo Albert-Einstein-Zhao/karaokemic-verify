@@ -127,18 +127,27 @@ final class NetworkController {
                 self?.state = .failed("\(err.localizedDescription)")
             }
         }
-        control.start(queue: .global(qos: .utility)
+        control.start(queue: .global(qos: .utility))
 
         // 控制连接收包
-        control.receiveMessage { [weak self] data, _, _, error in
-            guard let self, let data, error == nil else { return }
-            self.handleControl(data)
-            // 继续收下一包
-            if let c = self.controlConnection {
-                c.receiveMessage { d, _, _, e in
-                    if let d, e == nil { self.handleControl(d) }
-                }
+        receiveControlLoop()
+    }
+
+    /// 控制通道收包循环。
+    ///
+    /// NWConnection.receiveMessage 是「一次性」的 —— 每调一次只收一个包，
+    /// 所以必须收到后再次调用自己，否则只能收到第一条控制消息。
+    /// 用 controlConnection 做身份校验，disconnect() 置空后循环自然停止。
+    private func receiveControlLoop() {
+        guard let connection = controlConnection else { return }
+        connection.receiveMessage { [weak self] data, _, _, error in
+            guard let self, error == nil else { return }
+            // 身份校验：期间可能已经 disconnect/重连，避免往老连接上挂循环
+            guard self.controlConnection === connection else { return }
+            if let data {
+                self.handleControl(data)
             }
+            self.receiveControlLoop()
         }
     }
 
