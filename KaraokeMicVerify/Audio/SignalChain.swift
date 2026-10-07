@@ -203,7 +203,9 @@ final class SignalChain {
         }
 
         // ── 阶段 [9]：混响 ──
-        let final: [Float]
+        // ★ 必须是 var：下面混响分支里对它做逐元素赋值（取左声道），
+        //   声明成 let 会报 "cannot mutate subscript of immutable value"
+        var final: [Float]
         if params.reverbWet > 0.005 {
             reverb.update(parameters: ReverbParameters(
                 wet: params.reverbWet,
