@@ -1,0 +1,221 @@
+# ══════════════════════════════════════════════════════════════════════
+#  雪宝 K歌麦克风 · 验证版 —— 无Mac 编译流水线
+# ══════════════════════════════════════════════════════════════════════
+#
+#  作用：在 GitHub 免费的 macOS runner 上把 Swift 源码编译成 unsigned.ipa
+#  产物：Actions 页面的 Artifacts 里下载 KaraokeMicVerify-unsigned.ipa
+#  后续：用 Windows 上的 Sideloadly 以免费 Apple ID 签名后装进iPhone
+#
+#  为什么能绕过 Mac：GitHub 官方提供 macOS runner，Apple 的 Xcode 许可允许
+#  在 CI 上做无签名构建（CODE_SIGNING_ALLOWED=NO）。签名放到本地用
+#  Sideloadly 完成。
+#
+#  免费额度：私有仓库每月 2000 分钟，macOS runner 按 10 倍系数折算
+#  ≈ 200 实际分钟。macOS 机器启动就吃掉约 2-3 分钟，本项目每次构建
+#  实际耗时约 12-15 分钟，够用几十次。
+# ══════════════════════════════════════════════════════════════════════
+
+name: Build unsigned IPA
+
+on:
+  # 手动触发：在 Actions 页面点 Run workflow
+  workflow_dispatch:
+  # 推 main 分支也自动构建，方便改完代码直接看结果
+  push:
+    branches: [main]
+    paths:
+      - 'KaraokeMicVerify/**'
+      - 'project.yml'
+      - '.github/workflows/build-ipa.yml'
+
+concurrency:
+  # 同分支只留一个构建在跑，新的取消旧的，省额度
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # 注意：macos-15 对应 Xcode 16.x，比 macos-latest 更稳（latest 会跳大版本）
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      # ── 1. 拉源码 ────────────────────────────────────────────────
+      - name: 拉取源码
+        uses: actions/checkout@v4
+
+      # ── 2. 选 Xcode ──────────────────────────────────────────────
+      # 官方策略：「每个 macOS 版本只支持一个 Xcode 大版本」。
+      # 硬编码 /Applications/Xcode_16.4.app 这类路径，官方一换版本就404。
+      # 所以这里动态探测：找到就用指定的，找不到就退回 runner 默认的那个。
+      - name: 选择 Xcode
+        run: |
+          set -e
+          echo "▸ runner 上可用的 Xcode："
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "  （目录列表为空，用默认）"
+
+          WANTED="/Applications/Xcode_16.4.app"
+          if [ -d "$WANTED" ]; then
+            echo "▸ 使用指定版本：$WANTED"
+            sudo xcode-select -s "$WANTED"
+          else
+            echo "▸ 指定版本不存在，改用 runner 默认 Xcode"
+            echo "▸ 提示：若编译失败，多半是默认 Xcode 换了版本导致 SDK 不兼容。"
+            echo "▸ 可用上面列出的实际名字替换 WANTED 变量。"
+          fi
+          echo "── 实际使用 ──"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # ── 3. 装 XcodeGen ───────────────────────────────────────────
+      # 工程用 project.yml 描述，.xcodeproj 是生成物，不入库（见 .gitignore）
+      - name: 安装 XcodeGen
+        run: |
+          brew update --quiet
+          brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        run: |
+          xcodegen generate
+          echo "── 生成的工程结构 ──"
+          ls -la KaraokeMicVerify.xcodeproj/
+
+      # ── 4. 编译（完全关闭签名）───────────────────────────────────
+      # CODE_SIGNING_ALLOWED=NO 是关键：runner 上没有开发证书，
+      # 任何签名步骤都会失败，直接关掉。产出的 .app 是「未签名」的，
+      # 交给 Sideloadly 签名。
+      - name: 编译 archive
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project KaraokeMicVerify.xcodeproj \
+            -scheme KaraokeMicVerify \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath ./build/KaraokeMicVerify.xcarchive \
+            -derivedDataPath ./build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            SWIFT_COMPILATION_MODE=wholemodule \
+            ONLY_ACTIVE_ARCH=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            archive \
+            2>&1 | tee build.log
+          echo "── archive exit code: $? ──"
+
+      # ── 5. 打包成 IPA ────────────────────────────────────────────
+      # xcodebuild 在没有签名凭证时无法 export 出 ipa，
+      # 所以手工拼标准 IPA 结构：Payload/KaraokeMicVerify.app
+      - name: 打包 unsigned IPA
+        run: |
+          set -e
+          APP="./build/KaraokeMicVerify.xcarchive/Products/Applications/KaraokeMicVerify.app"
+          if [ ! -d "$APP" ]; then
+            echo "❌ 没找到 .app，编译可能失败了。日志末尾："
+            tail -50 build.log
+            exit 1
+          fi
+
+          echo "▸ .app 体积：$(du -sh "$APP" | cut -f1)"
+          echo "▸ Mach-O 架构："
+          lipo -info "$APP/KaraokeMicVerify"
+
+          # IPA 标准结构：一个名为 Payload 的目录，里面放 .app
+          rm -rf ./build/Payload
+          mkdir -p ./build/Payload
+          cp -R "$APP" ./build/Payload/
+
+          cd ./build
+          zip -qry KaraokeMicVerify-unsigned.ipa Payload
+          cd ..
+
+          echo "▸ 产物信息："
+          ls -lh ./build/KaraokeMicVerify-unsigned.ipa
+          echo "▸ IPA 内部结构校验："
+          unzip -l ./build/KaraokeMicVerify-unsigned.ipa | head -8
+
+      # ── 6. 顺带验证 Info.plist 关键权限有没有带上 ────────────────
+      # 这三项任何一个漏了，App 装上也是废的：
+      #   NSMicrophoneUsageDescription  没有 → 拿不到麦克风
+      #   NSLocalNetworkUsageDescription 没有 → 局域网连接静默失败
+      #   UIBackgroundModes: audio      没有 → 锁屏就断流
+      - name: 校验权限声明
+        run: |
+          set -e
+          PLIST="./build/KaraokeMicVerify.xcarchive/Products/Applications/KaraokeMicVerify.app/Info.plist"
+
+          check() {
+            if plutil -extract "$1" raw -o - "$PLIST" >/dev/null 2>&1; then
+              echo "✅ $1"
+            else
+              echo "❌ $1 缺失 —— 这个 App 装了也不能用"
+              MISSING=1
+            fi
+          }
+
+          MISSING=0
+          check NSMicrophoneUsageDescription
+          check NSLocalNetworkUsageDescription
+          check UIBackgroundModes
+
+          if [ "$MISSING" != "0" ]; then
+            echo ""
+            echo "★ 权限声明不完整，构建终止。检查 KaraokeMicVerify/Resources/Info.plist"
+            exit 1
+          fi
+
+          echo ""
+          echo "▸ Bundle ID：$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")"
+          echo "▸ 版本：$(plutil -extract CFBundleShortVersionString raw -o - "$PLIST")"
+          echo "▸ 最低系统：$(plutil -extract MinimumOSVersion raw -o - "$PLIST")"
+
+      # ── 7. 上传产物 ──────────────────────────────────────────────
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: KaraokeMicVerify-unsigned
+          path: build/KaraokeMicVerify-unsigned.ipa
+          # Actions 产物最多存 90 天，默认 14 天就够用了
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── 8. 失败时把日志一起传上去，方便排查 ──────────────────────
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+
+  # ══════════════════════════════════════════════════════════════════
+  #  只做「检查」不产出IPA 的轻量任务
+  #  改完 DSP 参数想快速确认能编译、但暂时不用装机时用这个
+  # ══════════════════════════════════════════════════════════════════
+  check-only:
+    name: 仅编译检查（不打包）
+    runs-on: macos-15
+    timeout-minutes: 30
+    if: false # 默认不跑，手动改 true 或单独触发时启用
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          ls -d /Applications/Xcode*.app || true
+          xcodebuild -version
+      - run: brew install xcodegen && xcodegen generate
+      - run: |
+          xcodebuild \
+            -project KaraokeMicVerify.xcodeproj \
+            -scheme KaraokeMicVerify \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            SWIFT_COMPILATION_MODE=wholemodule \
+            build

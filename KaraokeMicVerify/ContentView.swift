@@ -1,0 +1,337 @@
+//
+//  ContentView.swift
+//  雪宝 K歌麦克风 · 极简验证版
+//
+//  单屏界面，目的只有一个：**验证 DSP 与延迟**，不做任何视觉包装。
+//
+//  显示的6 个关键指标（决定了「这方案能不能成」）：
+//  1. 连接状态 +盒子名
+//  2. 端到端延迟（RTT/2 + 盒子缓冲 + 输出）—— 对标蓝牙 150-300ms
+//  3. AEC 效果（ERLE dB，越高越好；> 10dB 算有效）
+//  4. 啸叫检测（有无 + 频率）
+//  5. 输入电平（看有没有拾到音）
+//  6. 已发帧数（确认真的在发）
+//
+//  顶部 4 个开关：直接调 DSP 参数，用来现场找最优值。
+//
+
+import SwiftUI
+
+struct ContentView: View {
+    @StateObject private var vm = VerifyViewModel()
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.043, green: 0.055, blue: 0.090)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(spacing: 18) {
+                    header
+
+                    // ── IP 输入 + 连接 ──
+                    ipSection
+
+                    // ── 关键指标 ──
+                    if vm.network.state == .ready {
+                        metricsSection
+                        waveformSection
+                        controlsSection
+                    } else {
+                        disconnectedHint
+                    }
+
+                    Spacer(minLength: 20)
+                }
+                .padding(20)
+            }
+        }
+        .onAppear {
+            vm.audio.onStateChange = { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+
+    private var header: some View {
+        VStack(spacing: 4) {
+            Text("K歌麦克风 · 验证版")
+                .font(.system(size: 24, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+            Text("iPhone → 局域网 → 极光盒子")
+                .font(.system(size: 12))
+                .foregroundStyle(.gray)
+        }
+        .padding(.top, 10)
+    }
+
+    private var ipSection: some View {
+        VStack(spacing: 12) {
+            HStack {
+                TextField("盒子 IP", text: $vm.boxIP)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 17, design: .monospaced))
+                    .keyboardType(.numbersAndPunctuation)
+                    .autocorrectionDisabled()
+                    .padding(12)
+                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(.white)
+
+                Button {
+                    if vm.isConnected {
+                        vm.disconnect()
+                    } else {
+                        vm.connect(boxIP: vm.boxIP)
+                    }
+                } label: {
+                    Text(vm.isConnected ? "断开" : "连接")
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(width: 72, height: 48)
+                        .background(vm.isConnected ? Color.red.opacity(0.7) : Color.cyan,
+                                    in: RoundedRectangle(cornerRadius: 10))
+                        .foregroundStyle(vm.isConnected ? .white : .black)
+                }
+            }
+
+            statusRow
+        }
+    }
+
+    private var statusRow: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(vm.statusColor)
+                .frame(width: 9, height: 9)
+            Text(vm.network.state.text)
+                .font(.system(size: 13))
+                .foregroundStyle(.gray)
+            if !vm.network.deviceName.isEmpty {
+                Text("· 设备：\(vm.network.deviceName)")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.gray)
+            }
+            Spacer()
+            if vm.isConnected {
+                Text("已发 \(vm.sentFrames) 帧")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.gray)
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+
+    private var metricsSection: some View {
+        VStack(spacing: 12) {
+            // ★ 延迟 —— 最关键的指标
+            bigMetric(
+                title: "端到端延迟",
+                value: String(format: "%.0f", vm.network.estimatedLatencyMs),
+                unit: "ms",
+                caption: "RTT/2 \(String(format: "%.1f", vm.network.roundTripMs)) + 盒子缓冲 \(String(format: "%.0f", vm.network.bufferFillMs)) + 输出 20",
+                tint: vm.network.estimatedLatencyMs < 120 ? .green : .orange
+            )
+
+            HStack(spacing: 12) {
+                // AEC 效果
+                smallMetric(
+                    title: "AEC 抑制量",
+                    value: String(format: "%.1f", vm.erle),
+                    unit: "dB",
+                    caption: vm.erle > 10 ? "有效" : (vm.erle > 0 ? "偏弱" : "未工作"),
+                    tint: vm.erle > 10 ? .green : .orange
+                )
+
+                // 啸叫
+                smallMetric(
+                    title: "啸叫检测",
+                    value: vm.howlingDetected ? "\(vm.howlingFreqs.count)" : "0",
+                    unit: vm.howlingDetected ? "处" : "",
+                    caption: vm.howlingDetected
+                        ? vm.howlingFreqs.prefix(2)
+                            .map { String(format: "%.0f", $0) }
+                            .joined(separator: "/") + " Hz"
+                        : "未检出",
+                    tint: vm.howlingDetected ? .red : .green
+                )
+
+                // 电平
+                smallMetric(
+                    title: "输入电平",
+                    value: vm.currentLevelDb <= -100 ? "—" : String(format: "%.0f", vm.currentLevelDb),
+                    unit: "dB",
+                    caption: vm.isSinging ? "检测到人声" : "静音",
+                    tint: vm.currentLevelDb > -50 ? .green : .gray
+                )
+            }
+        }
+    }
+
+    private var waveformSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("电平波形（最近 60 帧· 每帧 5ms）")
+                .font(.system(size: 12))
+                .foregroundStyle(.gray)
+            WaveformView(values: vm.levelHistory)
+                .frame(height: 70)
+        }
+        .padding(14)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  DSP 参数开关 —— 用来现场找最优值
+    // ══════════════════════════════════════════════════════════════
+
+    private var controlsSection: some View {
+        VStack(spacing: 10) {
+            Text("DSP 参数（现场调）")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            toggleRow("回声消除 AEC", value: vm.aecOn)
+                { vm.aecOn = $0 }
+            sliderRow("AEC 强度", value: vm.aecStrength, range: 0...1, fmt: "%.2f") {
+                vm.aecStrength = $0
+            }
+            toggleRow("啸叫抑制", value: vm.howlOn)
+                { vm.howlOn = $0 }
+            sliderRow("啸叫强度", value: vm.howlStrength, range: 0...1, fmt: "%.2f") {
+                vm.howlStrength = $0
+            }
+            sliderRow("输入增益", value: vm.inputGain, range: -20...20, fmt: "%.0f dB") {
+                vm.inputGain = $0
+            }
+            sliderRow("混响", value: vm.reverb, range: 0...0.4, fmt: "%.2f") {
+                vm.reverb = $0
+            }
+            Picker("混响预设", selection: $vm.reverbPreset) {
+                ForEach(ReverbPreset.allCases) { preset in
+                    Text(preset.displayName).tag(preset)
+                }
+            }
+            .pickerStyle(.menu)
+        }
+        .padding(14)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func toggleRow(_ title: String, value: Bool, onChange: @escaping (Bool) -> Void) -> some View {
+        HStack {
+            Text(title).font(.system(size: 13)).foregroundStyle(.white)
+            Spacer()
+            Toggle("", isOn: Binding(get: { value }, set: onChange))
+                .labelsHidden()
+                .tint(.cyan)
+        }
+    }
+
+    private func sliderRow(_ title: String, value: Double, range: ClosedRange<Double>,
+                          fmt: String, onChange: @escaping (Double) -> Void) -> some View {
+        VStack(spacing: 2) {
+            HStack {
+                Text(title).font(.system(size: 13)).foregroundStyle(.white)
+                Spacer()
+                Text(String(format: fmt, value))
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.cyan)
+            }
+            Slider(value: Binding(get: { value }, set: onChange), in: range)
+                .tint(.cyan)
+        }
+    }
+
+    private var disconnectedHint: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .font(.system(size: 36))
+                .foregroundStyle(.gray)
+            Text("请在下面输入盒子 IP，点「连接」")
+                .font(.system(size: 13))
+                .foregroundStyle(.gray)
+            Text("盒子 IP：192.168.1.5")
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.cyan.opacity(0.8))
+        }
+        .padding(.top, 30)
+    }
+
+    // ══════════════════════════════════════════════════════════════
+
+    private func bigMetric(title: String, value: String, unit: String,
+                           caption: String, tint: Color) -> some View {
+        VStack(spacing: 4) {
+            Text(title).font(.system(size: 12)).foregroundStyle(.gray)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value)
+                    .font(.system(size: 46, weight: .bold, design: .monospaced))
+                    .foregroundStyle(tint)
+                Text(unit).font(.system(size: 16)).foregroundStyle(tint.opacity(0.7))
+            }
+            Text(caption)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.gray)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 16)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func smallMetric(title: String, value: String, unit: String,
+                             caption: String, tint: Color) -> some View {
+        VStack(spacing: 3) {
+            Text(title).font(.system(size: 11)).foregroundStyle(.gray)
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                Text(value)
+                    .font(.system(size: 22, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(tint)
+                Text(unit).font(.system(size: 11)).foregroundStyle(tint.opacity(0.7))
+            }
+            Text(caption)
+                .font(.system(size: 10))
+                .foregroundStyle(.gray)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  波形图
+// ══════════════════════════════════════════════════════════════════════
+
+struct WaveformView: View {
+    let values: [Float]
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width / CGFloat(max(values.count, 1))
+            HStack(alignment: .bottom, spacing: 1) {
+                ForEach(Array(values.enumerated()), id: \.offset) { _, v in
+                    let norm = (max(-60, min(0, v)) + 60) / 60
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(color(for: v))
+                        .frame(width: max(w - 1, 1),
+                               height: max(CGFloat(norm) * geo.size.height, 1))
+                }
+            }
+        }
+    }
+
+    private func color(for v: Float) -> Color {
+        if v > -3 { return .red }
+        if v > -12 { return .orange }
+        return .green
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+
+#Preview {
+    ContentView()
+}

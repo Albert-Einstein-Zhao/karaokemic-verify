@@ -1,0 +1,202 @@
+//
+//  AudioEngine.swift
+//  雪宝 K歌麦克风 · 极简验证版
+//
+//  AVAudioEngine 封装：麦克风采集 → SignalChain → UDP 发送。
+//
+//  ════════════════════════════════════════════════════════════════════════
+//  ★★ 帧长决策（本版与正式版的核心差异）
+//  ════════════════════════════════════════════════════════════════════════
+//  正式版用 frameSize = 960（20ms），但协议 frameCount 是 u8，最大 255。
+//  → 960 塞不进 1 字节 → 静默截断成 255，
+//    每包实际发出 1920 字节、头部只声明 510 字节 → **87% 音频被对端丢弃**。
+//
+//  本版改为 frameSize = 240（5ms）：
+//  · 240≤ 255 ✅ 合法，frameCount 无截断
+//  · 5ms 粒度对延迟有正面帮助（更早发出，缓冲更浅）
+//  · 代价：包头占比 16/496 ≈ 3.2%（可接受；正式版 87% 才是灾难）
+//
+//  采集格式也做了调整：48kHz / Int16 —— 避免浮点转换开销，
+//  且与盒子端 AudioFormat.ENCODING_PCM_16BIT 完全一致。
+// ════════════════════════════════════════════════════════════════════════
+//
+
+import AVFoundation
+import Foundation
+
+final class AudioEngineController {
+
+    // MARK: - 依赖
+
+    private let network: NetworkController
+    private var signalChain: SignalChain
+    private let engine = AVAudioEngine()
+
+    /// ★ 240 帧 = 5ms @48kHz，必须 ≤ KaraokeProtocol.safeFrameCount
+    private let frameSize: Int = KaraokeProtocol.safeFrameCount
+    private let sampleRate: Double = 48000
+
+    // MARK: - 状态
+
+    private(set) var isRunning = false
+    private(set) var currentLevelDb: Float = -120
+    private(set) var peakLevelDb: Float = -120
+    private(set) var erleDb: Float = 0
+    private(set) var howlingDetected = false
+    private(set) var howlingFreqs: [Float] = []
+    private(set) var isSinging = false
+
+    private(set) var frameCounter: Int = 0
+    private(set) var sentFrames: Int = 0
+
+    /// 最近 60 帧电平（画波形用）
+    private(set) var levelHistory: [Float] = Array(repeating: -60, count: 60)
+
+    // MARK: - 初始化
+
+    init(network: NetworkController) {
+        self.network = network
+        self.signalChain = SignalChain(
+            sampleRate: Float(sampleRate),
+            frameSize: KaraokeProtocol.safeFrameCount
+        )
+    }
+
+    // MARK: - 会话
+
+    private func configureSession() throws {
+        let session = AVAudioSession.sharedInstance()
+
+        // .playAndRecord + .measurement：拿到最原始信号交给自研 DSP
+        //注意：不用 .voiceChat 模式 —— 它会启用系统 VoiceProcessingIO，
+        // 里面的 AEC 只能消除 iPhone 自己的声音，对电视喇叭的回声无效，
+        // 反而会引入额外延迟和信号染色。
+        try session.setCategory(.playAndRecord, mode: .measurement, options: [
+            .defaultToSpeaker,
+            .allowBluetooth,
+            .mixWithOthers
+        ])
+
+        try session.setPreferredIOBufferDuration(0.005)   // 5ms，尽量压低采集延迟
+        try session.setPreferredSampleRate(sampleRate)
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+    }
+
+    // MARK: - 启动 / 停止
+
+    func start() throws {
+        guard !isRunning else { return }
+
+        try configureSession()
+
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw NSError(domain: "AudioEngine", code: -1, userInfo: [
+                NSLocalizedDescriptionKey:
+                "音频输入无效（采样率 \(format.sampleRate)），请检查麦克风权限"
+            ])
+        }
+
+        // ★ 用 nil format 让系统用原生格式，避免强制转换导致的额外延迟/失真
+        input.installTap(onBus: 0,
+                         bufferSize: AVAudioFrameCount(frameSize),
+                         format: nil) { [weak self] buffer, _ in
+            self?.process(buffer)
+        }
+
+        engine.prepare()
+        try engine.start()
+
+        isRunning = true
+        signalChain.reset()
+    }
+
+    func stop() {
+        guard isRunning else { return }
+
+        if engine.inputNode.numberOfInputs > 0 {
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        engine.stop()
+        signalChain.reset()
+
+        isRunning = false
+        currentLevelDb = -120
+        erleDb = 0
+        howlingDetected = false
+        isSinging = false
+
+        try? AVAudioSession.sharedInstance().setActive(false,
+                                                         options: .notifyOthersOnDeactivation)
+    }
+
+    // MARK: - 实时处理
+
+    private func process(_ buffer: AVAudioPCMBuffer) {
+        // Int16 格式优先（与盒子端一致，零转换）
+        var samples: [Float]
+
+        if let ch16 = buffer.int16ChannelData?[0] {
+            let n = Int(buffer.frameLength)
+            samples = [Float](repeating: 0, count: n)
+            for i in 0..<n {
+                samples[i] = Float(ch16[i]) / 32768.0
+            }
+        } else if let ch32 = buffer.floatChannelData?[0] {
+            let n = Int(buffer.frameLength)
+            samples = [Float](repeating: 0, count: n)
+            for i in 0..<n { samples[i] = ch32[i] }
+        } else {
+            return
+        }
+
+        guard samples.count > 0 else { return }
+
+        // ── DSP ──
+        let out = signalChain.process(input: samples)
+
+        // ★ 必须先 record 再 send：AEC 的参考信号要跟实际发出的内容一致
+        signalChain.recordSentAudio(out.processed)
+
+        // ── 发送（frameCount 240 ≤ 255，不会截断）──
+        if network.state == .ready {
+            network.sendAudioFrame(samples: out.processed, sampleRate: UInt16(sampleRate))
+            sentFrames += 1
+        }
+
+        // ── 监测（每 3 帧刷一次 UI，降低刷新压力）──
+        frameCounter += 1
+        if frameCounter % 3 == 0 {
+            let level = out.outputLevelDb
+            let peak = max(peakLevelDb * 0.95, level)
+            let erle = out.erleDb
+            let howl = out.howling
+            let freqs = out.howlingFrequencies
+            let singing = out.doubleTalk
+
+            DispatchQueue.main.async {
+                self.currentLevelDb = level
+                self.peakLevelDb = peak
+                self.erleDb = erle
+                self.howlingDetected = howl
+                self.howlingFreqs = freqs
+                self.isSinging = singing
+                self.levelHistory.removeFirst()
+                self.levelHistory.append(max(level, -60))
+            }
+        }
+    }
+
+    // MARK: - 参数
+
+    func updateParameters(_ p: SignalParameters) {
+        signalChain.parameters = p
+    }
+
+    var currentParameters: SignalParameters { signalChain.parameters }
+
+    /// 实测采集帧长（诊断用：确认系统真的按 240 帧回调）
+    var actualFrameSize: Int { frameSize }
+}

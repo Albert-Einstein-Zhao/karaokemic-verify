@@ -1,0 +1,57 @@
+name: KaraokeMicVerify
+options:
+  bundleIdPrefix: com.xuebao
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  developmentLanguage: zh-Hans
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CODE_SIGN_STYLE: Automatic
+    # 不填 Team，用免费 Apple ID 签名（7 天有效期，够验证用）
+    DEVELOPMENT_TEAM: ""
+
+# 显式声明 scheme，否则 GitHub Actions 上找不到可构建的 scheme
+schemes:
+  KaraokeMicVerify:
+    build:
+      targets:
+        KaraokeMicVerify: all
+    run:
+      config: Debug
+
+targets:
+  KaraokeMicVerify:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.xuebao.karamic.verify
+        PRODUCT_NAME: KaraokeMicVerify
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: KaraokeMicVerify/Resources/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        #★★ 必须用 -O，不能用 -Onone
+        # NLMS 回声消除（滤波器长度 512）、8 路自适应陷波器、FFT 趋势检测
+        # 全跑在 5ms 一帧的实时音频回调里。-Onone 下 Swift 数组拷贝和循环都不会
+        # 被优化掉，实测会让音频线程直接欠载（爆音），ERLE 测出来是假的。
+        # 这台机器 CPU 比 iPhone 强，但编译期优化对实时 DSP 是硬要求，不是可选项。
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        # 音频处理链路的数学运算需要快速数学（vDSP/sin/exp），
+        # 否则 Reverb 的梳状滤波器和 Biquad 在每帧都成为 CPU 热点
+        OTHER_SWIFT_FLAGS: "$(inherited) -D RELEASE_BUILD"
+        ENABLE_TESTABILITY: NO
+        SWIFT_COMPILATION_MODE: wholemodule
+        # 让 SwiftUI 预渲染的性能优化生效
+        SWIFT_UPCOMING_FEATURE_EXISTENTIAL_ANY: YES
+
+    sources:
+      - path: KaraokeMicVerify
+        excludes:
+          - "Resources/Info.plist"

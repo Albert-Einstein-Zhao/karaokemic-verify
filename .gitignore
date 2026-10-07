@@ -1,0 +1,27 @@
+# ── XcodeGen 生成物 ──
+# .xcodeproj 由 project.yml 描述生成，不入库。
+# 入库会导致 GitHub Actions 上和你本地的工程状态可能不同步。
+*.xcodeproj/
+*.xcworkspace/
+
+# ── 编译产物 ──
+build/
+DerivedData/
+*.ipa
+*.app/
+*.dSYM.zip
+*.xcarchive/
+
+# ── Xcode 用户状态（每人不同）──
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# ── macOS 垃圾 ──
+.DS_Store
+
+# ── Sideloadly / 签名残留 ──
+*.mobileprovision
+*.p12
+
+# ★ 注意：Info.plist 和 Swift 源码必须入库，不要误加进忽略列表
