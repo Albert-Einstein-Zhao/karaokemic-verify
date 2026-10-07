@@ -72,9 +72,12 @@ final class HowlingSuppressor {
     private var window: [Float]
     /// FFT 预计算 twiddle 因子（vDSP 需要）
     private var fftSetup: FFTSetup
-    /// FFT 分离复数缓冲（realp/imagp 分离存放，vDSP_fft_zrip 专用格式）。
-    /// ★ 不是 DSPComplex —— 交织复数只用在 ctoz/ztoc 的转换两端。
-    private var fftSplit: DSPSplitComplex
+    /// FFT 分离复数缓冲的实部/虚部（各 fftSize/2 点）。
+    /// ★ 手工管理两个数组而不是用 DSPSplitComplex：
+    ///   vDSP_fft_zrip 要UnsafeMutablePointer<DSPSplitComplex>，
+    ///   Swift 不做自动桥接，只能用 withUnsafe 手工把两个数组的地址组装成结构体。
+    private var fftReal: [Float]
+    private var fftImag: [Float]
     private var overlap: [Float]
 
     private var frameCounter: Int = 0
@@ -89,33 +92,27 @@ final class HowlingSuppressor {
         self.hopSize = fftSize / 4
 
         // 汉宁窗
+        // vDSP_hann_window 也要裸指针，且第 3 参数是 Int32
         var w = [Float](repeating: 0, count: fftSize)
-        vDSP_hann_window(&w, vDSP_Length(fftSize), vDSP_HANN_NORM)
+        w.withUnsafeMutableBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_hann_window(base, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+        }
         self.window = w
 
-        // twiddle 因子预计算
-        // Swift 里的正确签名：
-        //   vDSP_ctts(ofType: UnsafePointer<DSPComplex>,
-        //             radixOver: UnsafePointer<Int32>,
-        //             ofType: UnsafeMutablePointer<DSPComplex>,
-        //             radixOver: UnsafeMutablePointer<Int32>,
-        //             log2n: Int32)
-        // 参数名不能省，且 log2n 要用 Int32（不是 vDSP_Length）。
-        let log2n = Int32(round(log2(Double(fftSize))))
-        var twiddleIn = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: fftSize / 2)
-        var twiddleBitRev = [Int32](repeating: 0, count: fftSize / 2)
-        vDSP_ctts(ofType: &twiddleIn,
-                  radixOver: &twiddleBitRev,
-                  ofType: &twiddleIn,
-                  radixOver: &twiddleBitRev,
-                  log2n: log2n)
         var setup = FFTSetup()
         vDSP_create_fftsetup(vDSP_Length(fftSize), FFTRadix(kFFTRadix2), &setup)
         self.fftSetup = setup
 
         self.energyHistory = [Float](repeating: 0, count: binCount)
-        self.fftSplit = DSPSplitComplex(realp: [Float](repeating: 0, count: fftSize / 2),
-                                       imagp: [Float](repeating: 0, count: fftSize / 2))
+        // FFT 缓冲：分离复数要用两个独立数组手工管理。
+        // ★不能用 DSPSplitComplex —— 它是 Swift 结构体（值类型），
+        //   而 vDSP_fft_zrip 要的是UnsafeMutablePointer<DSPSplitComplex>，
+        //   Swift 没有为 vDSP 函数做自动 inout-to-pointer 桥接，
+        //   必须用withUnsafe 手工取地址。同理 vDSP_ctts 在 Swift 里
+        //   根本不存在（只存在于 C 头文件），不能用。
+        self.fftReal = [Float](repeating: 0, count: fftSize / 2)
+        self.fftImag = [Float](repeating: 0, count: fftSize / 2)
         self.overlap = [Float](repeating: 0, count: hopSize)
 
         //陷波器初始化：均匀铺开在 200Hz ~ 8kHz，初始静默（gain 极低）
@@ -164,15 +161,12 @@ final class HowlingSuppressor {
         let start = n - hopSize
         guard start >= 0 else { return }
 
-        // 取样本 + 加窗 + 补零到 fftSize
+        // 交织实数输入：realp[2k]=实部, realp[2k+1]=虚部，长度 fftSize
         var realp = [Float](repeating: 0, count: fftSize)
-        var imagp = [Float](repeating: 0, count: fftSize / 2)
+        let half = fftSize / 2
 
-        // 窗口要用的是「窗的后 hopSize 段」，对应连续分析的重叠区。
-        // window 长度 fftSize，取 windowStart..<windowStart+hopSize
-        // windowStart = fftSize - hopSize（对齐到窗口尾部）
+        // 窗口要用的是「窗的后 hopSize 段」，对应连续分析的重叠区
         let windowStart = fftSize - hopSize
-        // vDSP 只接受裸指针，数组/切片都要先 withUnsafe 拿 baseAddress
         buf.withUnsafeBufferPointer { src in
             window.withUnsafeBufferPointer { win in
                 realp.withUnsafeMutableBufferPointer { dst in
@@ -184,22 +178,39 @@ final class HowlingSuppressor {
                 }
             }
         }
-        // 剩余部分保持0（补零到 fftSize）
+        // 剩余部分保持 0（补零到 fftSize）
 
-        // 原地 FFT
-        // vDSP_fft_zrip 只接受 DSPSplitComplex（分离复数：实部/虚部分开两个数组），
-        // 不是 DSPComplex（交织复数）。用 vDSP_zvabs 直接从分离复数算幅度，
-        // 不需要转回去 —— 省一次转换，也避免了指针类型混用。
-        var mags = [Float](repeating: 0, count: fftSize / 2)
+        // 幅度谱：只需前 half 个点
+        var mags = [Float](repeating: 0, count: half)
+
         realp.withUnsafeMutableBufferPointer { rp in
-            imagp.withUnsafeMutableBufferPointer { ip in
-                // 交错 Float(real,imag,...) → 分离实部/虚部
-                vDSP_ctoz(rp.baseAddress!, 2, &fftSplit, 1, vDSP_Length(fftSize / 2))
-                // 原地实数 FFT
-                vDSP_fft_zrip(fftSetup, &fftSplit, 1, vDSP_Length(fftSize / 2),
-                              FFTDirection(FFT_FORWARD))
-                // 直接求幅度（只需要前binCount 个）
-                vDSP_zvabs(&fftSplit, 1, &mags, 1, vDSP_Length(fftSize / 2))
+            fftReal.withUnsafeMutableBufferPointer { fr in
+                fftImag.withUnsafeMutableBufferPointer { fi in
+                    guard let rpb = rp.baseAddress,
+                          let rb = fr.baseAddress,
+                          let ib = fi.baseAddress else { return }
+
+                    // ① 交织 → 分离（stride 2：跳过每个复数里的虚部）
+                    vDSP_ctoz(rpb, 2, &rb, 1, vDSP_Length(half))
+
+                    // ② 原地实数 FFT
+                    //    Swift 不做 (数组,数组) → DSPSplitComplex 的自动桥接，
+                    //    必须手工组装结构体再取地址
+                    var split = DSPSplitComplex(realp: rb, imagp: ib)
+                    vDSP_fft_zrip(fftSetup, &split, 1, vDSP_Length(half),
+                                  FFTDirection(FFT_FORWARD))
+
+                    // ③ 分离 → 交织，写回 realp（幅度计算要用交错格式）
+                    vDSP_ztoc(&split, 1, rpb, 1, vDSP_Length(half))
+                }
+            }
+        }
+
+        // 幅度谱 = sqrt(re² + im²)，vDSP_zvabs 接受交织 DSPComplex
+        realp.withUnsafeBufferPointer { rp in
+            mags.withUnsafeMutableBufferPointer { mb in
+                guard let rpb = rp.baseAddress, let mp = mb.baseAddress else { return }
+                vDSP_zvabs(rpb, 1, mp, 1, vDSP_Length(half))
             }
         }
 
@@ -289,8 +300,13 @@ final class HowlingSuppressor {
             let notch = notches[i]
             guard notch.depth > 0.01 else { continue }
 
-            var biquad = notch.currentBiquad(depthScale: strengthOverride)
-            biquad.process(&buf)
+            // currentBiquad 返回的是「系数」(BiquadCoeffs)，
+            // process() 定义在「滤波器」(Biquad) 上 —— 需要包一层。
+            // 每次重建 Biquad 会清空历史状态，所以先 reset 再设系数，
+            // 避免旧的滤波器状态造成输出瞬态爆音。
+            var filter = Biquad(notch.currentBiquad(depthScale: strengthOverride))
+            filter.reset()
+            filter.process(&buf)
         }
     }
 

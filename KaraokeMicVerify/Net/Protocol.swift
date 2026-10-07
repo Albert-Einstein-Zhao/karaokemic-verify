@@ -27,6 +27,10 @@
 // ════════════════════════════════════════════════════════════════════════
 //
 
+//★★★ 必须 import Accelerate
+// 下面build() 里的 vDSP_vfixu（Float→Int16 转换）和 vDSP_Length 都在 Accelerate 里，
+//  只 import Foundation 会报 "cannot find 'vDSP_vfixu' in scope"。
+import Accelerate
 import Foundation
 
 // ════════════════════════════════════════════════════════════════════════

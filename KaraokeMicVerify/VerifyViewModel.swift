@@ -69,6 +69,7 @@ final class VerifyViewModel: ObservableObject {
                 self?.applyNetworkState(state)
             }
         }
+    }    // ← init() 结束
 
     private func applyNetworkState(_ state: NetworkController.State) {
         isNetworkReady = (state == .ready)
