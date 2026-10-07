@@ -88,11 +88,15 @@ final class HowlingSuppressor {
         self.hopSize = fftSize / 4
 
         // 汉宁窗
-        // vDSP_hann_window 也要裸指针，且第 3 参数是 Int32
-        var w = [Float](repeating: 0, count: fftSize)
+        //★ 用局部常量 fftSizeLocal，不要在闭包里引用 self.fftSize ——
+        //   init 尚未完成所有成员初始化时，闭包捕获 self 会报
+        //   "'self' captured by a closure before all members were initialized"
+        let fftSizeLocal = fftSize
+        var w = [Float](repeating: 0, count: fftSizeLocal)
+        // vDSP_hann_window 要裸指针，第3 参数是 Int32
         w.withUnsafeMutableBufferPointer { ptr in
             guard let base = ptr.baseAddress else { return }
-            vDSP_hann_window(base, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
+            vDSP_hann_window(base, vDSP_Length(fftSizeLocal), Int32(vDSP_HANN_NORM))
         }
         self.window = w
 
