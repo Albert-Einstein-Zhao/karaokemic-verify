@@ -70,7 +70,8 @@ final class HowlingSuppressor {
     private var energyHistory: [Float]
     /// 频谱分析用的窗口函数（汉宁窗，减少频谱泄漏）
     private var window: [Float]
-    /// FFT 预计算 twiddle 因子（vDSP 需要）
+    /// vDSP FFT 计划句柄（FFTSetup = OpaquePointer）。
+    /// 由 vDSP_create_fftsetup 返回，进程存活期间一直有效，无需销毁。
     private var fftSetup: FFTSetup
     /// FFT 分离复数缓冲的实部/虚部（各 fftSize/2 点）。
     /// ★ 手工管理两个数组而不是用 DSPSplitComplex：
@@ -100,8 +101,16 @@ final class HowlingSuppressor {
         }
         self.window = w
 
-        var setup = FFTSetup()
-        vDSP_create_fftsetup(vDSP_Length(fftSize), FFTRadix(kFFTRadix2), &setup)
+        // FFT 初始化。
+        // ★ vDSP_create_fftsetup 在 Swift 里返回 OpaquePointer?，
+        //   正确用法是 withUnsafeMutablePointer 手工接收返回值 ——
+        //   写 var setup = FFTSetup() 再传 &setup 是错的（那是 C 写法）。
+        // FFTSetup 是 OpaquePointer 的类型别名。
+        let radix = FFTRadix(kFFTRadix2)
+        guard let setup = vDSP_create_fftsetup(vDSP_Length(fftSize), radix) else {
+            // 理论上不会失败（512 是合法长度），但不给 guard 万一崩在这里没法查
+            fatalError("vDSP_create_fftsetup 失败：fftSize=\(fftSize)")
+        }
         self.fftSetup = setup
 
         self.energyHistory = [Float](repeating: 0, count: binCount)
@@ -183,6 +192,14 @@ final class HowlingSuppressor {
         // 幅度谱：只需前 half 个点
         var mags = [Float](repeating: 0, count: half)
 
+        // ★ 关键：vDSP 的输出参数是 UnsafeMutablePointer<DSPSplitComplex>，
+        //   不是两个独立的 Float 指针。必须先把 realp 的内容拆成
+        //   一个真正的 DSPSplitComplex 实例，再对它做 FFT。
+        //
+        // Swift 不做 (数组,数组)→DSPSplitComplex 的自动桥接，所以：
+        //   ① 用 withUnsafeMutableBufferPointer 拿到两个数组的可变指针
+        //   ② 手工组装 var split = DSPSplitComplex(realp:rb, imagp:ib)
+        //   ③ 对 &split 调用 vDSP 函数
         realp.withUnsafeMutableBufferPointer { rp in
             fftReal.withUnsafeMutableBufferPointer { fr in
                 fftImag.withUnsafeMutableBufferPointer { fi in
@@ -191,12 +208,10 @@ final class HowlingSuppressor {
                           let ib = fi.baseAddress else { return }
 
                     // ① 交织 → 分离（stride 2：跳过每个复数里的虚部）
-                    vDSP_ctoz(rpb, 2, &rb, 1, vDSP_Length(half))
-
-                    // ② 原地实数 FFT
-                    //    Swift 不做 (数组,数组) → DSPSplitComplex 的自动桥接，
-                    //    必须手工组装结构体再取地址
                     var split = DSPSplitComplex(realp: rb, imagp: ib)
+                    vDSP_ctoz(rpb, 2, &split, 1, vDSP_Length(half))
+
+                    // ② 原地实数 FFT（就地修改 split 指向的两个数组）
                     vDSP_fft_zrip(fftSetup, &split, 1, vDSP_Length(half),
                                   FFTDirection(FFT_FORWARD))
 
@@ -206,11 +221,13 @@ final class HowlingSuppressor {
             }
         }
 
-        // 幅度谱 = sqrt(re² + im²)，vDSP_zvabs 接受交织 DSPComplex
+        // 幅度谱 = sqrt(re² + im²)
+        // vDSP_zvabs 只接受 DSPSplitComplex 指针，不接受交织的 Float*。
+        // 而 vDSP_zvmags 接受交织的 DSPComplex 格式 —— 用它更省事。
         realp.withUnsafeBufferPointer { rp in
             mags.withUnsafeMutableBufferPointer { mb in
                 guard let rpb = rp.baseAddress, let mp = mb.baseAddress else { return }
-                vDSP_zvabs(rpb, 1, mp, 1, vDSP_Length(half))
+                vDSP_zvmags(rpb, 1, mp, 1, vDSP_Length(half))
             }
         }
 

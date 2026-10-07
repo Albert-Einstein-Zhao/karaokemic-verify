@@ -158,24 +158,30 @@ enum AudioFrameBuilder {
 
         // Float → Int16（PCM S16LE）
         //
-        // ★ 之前这里写的是 vDSP_vclip —— 那个函数签名是
-        //   (const Float* 输入, ..., const Float* 下限, const Float* 上限, Float* 输出, ...)
-        //   输入输出都必须是 Float，用它写进 [Int16] 是类型错误。
-        //   正确做法是 vDSP_vfixu：专用于 Float 数组 → Int16 数组，
-        //   超出范围的样本自动饱和钳位（不回绕），这正是我们要的行为。
-        var int16Buffer = [Int16](repeating: 0, count: frameCount)
+        // ★ 这里踩过两个坑：
+        //  ① 原来写 vDSP_vclip —— 签名是 (const Float*,…,Float*,…) 全 Float，
+        //     用它写进 [Int16] 是类型错误。
+        //  ② 改 vDSP_vfixu 也不对 —— 带 u 的是**无符号** UInt16 版本。
+        //     有符号 Int16 的函数名是 vDSP_vfix16（无 u）。
+        //
+        // 用 Swift 的 vDSP overlay 更简洁，等价且类型安全：
+        //   vDSP.floatingPointToInteger(_:integerType:rounding:)
+        // 需要 iOS 13+（本工程部署目标 15.0，满足）。
+        // 超出范围的样本自动饱和钳位（不回绕），正是我们要的行为。
+        let int16Buffer = vDSP.floatingPointToInteger(
+            samples,
+            integerType: Int16.self,
+            rounding: .towardZero
+        )
 
-        samples.withUnsafeBufferPointer { src in
-            int16Buffer.withUnsafeMutableBufferPointer { dst in
-                guard let srcBase = src.baseAddress,
-                      let dstBase = dst.baseAddress else { return }
-                vDSP_vfixu(srcBase, 1, dstBase, 1, vDSP_Length(frameCount))
-            }
-        }
-
-        int16Buffer.withUnsafeBufferPointer { src in
-            guard let base = src.baseAddress else { return }
-            data.append(UnsafeRawBufferPointer(start: base, count: frameCount * 2))
+        // Int16 数组 → 小端字节流。
+        // ★ 不要用 data.append(UnsafeRawBufferPointer(...)) ——
+        //   那个重载不是所有 SDK 都有，会报 "missing argument label 'contentsOf:'"。
+        //   逐元素 append(UInt8(truncatingIfNeeded:)) 最稳，240 个样本的开销可忽略。
+        for v in int16Buffer {
+            let u = UInt16(bitPattern: v)
+            data.append(UInt8(truncatingIfNeeded: u))        // 低字节
+            data.append(UInt8(truncatingIfNeeded: u >> 8))     // 高字节
         }
 
         return data
