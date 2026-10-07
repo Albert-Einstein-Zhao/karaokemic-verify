@@ -70,15 +70,10 @@ final class HowlingSuppressor {
     private var energyHistory: [Float]
     /// 频谱分析用的窗口函数（汉宁窗，减少频谱泄漏）
     private var window: [Float]
-    /// vDSP FFT 计划句柄（FFTSetup = OpaquePointer）。
-    /// 由 vDSP_create_fftsetup 返回，进程存活期间一直有效，无需销毁。
-    private var fftSetup: FFTSetup
-    /// FFT 分离复数缓冲的实部/虚部（各 fftSize/2 点）。
-    /// ★ 手工管理两个数组而不是用 DSPSplitComplex：
-    ///   vDSP_fft_zrip 要UnsafeMutablePointer<DSPSplitComplex>，
-    ///   Swift 不做自动桥接，只能用 withUnsafe 手工把两个数组的地址组装成结构体。
-    private var fftReal: [Float]
-    private var fftImag: [Float]
+    /// vDSP.DFT 计划（Swift overlay，值类型）。
+    /// ★ 在 init 里创建一次复用，不要每帧 new —— DFT 内部会分配内存。
+    private let dft: vDSP.DFT<Float>
+    /// overlap-add 用的重叠区
     private var overlap: [Float]
 
     private var frameCounter: Int = 0
@@ -101,27 +96,16 @@ final class HowlingSuppressor {
         }
         self.window = w
 
-        // FFT 初始化。
-        // ★ vDSP_create_fftsetup 在 Swift 里返回 OpaquePointer?，
-        //   正确用法是 withUnsafeMutablePointer 手工接收返回值 ——
-        //   写 var setup = FFTSetup() 再传 &setup 是错的（那是 C 写法）。
-        // FFTSetup 是 OpaquePointer 的类型别名。
-        let radix = FFTRadix(kFFTRadix2)
-        guard let setup = vDSP_create_fftsetup(vDSP_Length(fftSize), radix) else {
-            // 理论上不会失败（512 是合法长度），但不给 guard 万一崩在这里没法查
-            fatalError("vDSP_create_fftsetup 失败：fftSize=\(fftSize)")
-        }
-        self.fftSetup = setup
+        // FFT 不再手工管理指针 —— 改用 vDSP.DFT Swift overlay。
+        // 它是值类型，创建一次复用，避免每帧分配内存。
+        // .realForward = 实数输入的单边谱变换，正好对应原来的 fft_zrip。
+        // 512 是 2 的幂，DFT 支持；force unwrap 安全。
+        self.dft = vDSP.DFT(count: fftSize,
+                            direction: .forward,
+                            transformType: .realForward,
+                            ofType: Float.self)!
 
         self.energyHistory = [Float](repeating: 0, count: binCount)
-        // FFT 缓冲：分离复数要用两个独立数组手工管理。
-        // ★不能用 DSPSplitComplex —— 它是 Swift 结构体（值类型），
-        //   而 vDSP_fft_zrip 要的是UnsafeMutablePointer<DSPSplitComplex>，
-        //   Swift 没有为 vDSP 函数做自动 inout-to-pointer 桥接，
-        //   必须用withUnsafe 手工取地址。同理 vDSP_ctts 在 Swift 里
-        //   根本不存在（只存在于 C 头文件），不能用。
-        self.fftReal = [Float](repeating: 0, count: fftSize / 2)
-        self.fftImag = [Float](repeating: 0, count: fftSize / 2)
         self.overlap = [Float](repeating: 0, count: hopSize)
 
         //陷波器初始化：均匀铺开在 200Hz ~ 8kHz，初始静默（gain 极低）
@@ -189,46 +173,25 @@ final class HowlingSuppressor {
         }
         // 剩余部分保持 0（补零到 fftSize）
 
-        // 幅度谱：只需前 half 个点
-        var mags = [Float](repeating: 0, count: half)
-
-        // ★ 关键：vDSP 的输出参数是 UnsafeMutablePointer<DSPSplitComplex>，
-        //   不是两个独立的 Float 指针。必须先把 realp 的内容拆成
-        //   一个真正的 DSPSplitComplex 实例，再对它做 FFT。
+        // ── FFT 与幅度谱 ──
         //
-        // Swift 不做 (数组,数组)→DSPSplitComplex 的自动桥接，所以：
-        //   ① 用 withUnsafeMutableBufferPointer 拿到两个数组的可变指针
-        //   ② 手工组装 var split = DSPSplitComplex(realp:rb, imagp:ib)
-        //   ③ 对 &split 调用 vDSP 函数
-        realp.withUnsafeMutableBufferPointer { rp in
-            fftReal.withUnsafeMutableBufferPointer { fr in
-                fftImag.withUnsafeMutableBufferPointer { fi in
-                    guard let rpb = rp.baseAddress,
-                          let rb = fr.baseAddress,
-                          let ib = fi.baseAddress else { return }
+        // ★ 这里原来用 C 风格的 vDSP_ctoz / vDSP_fft_zrip / vDSP_ztoc / vDSP_zvmags，
+        //   全部要求 UnsafePointer<DSPSplitComplex> 或 <DSPComplex>，
+        //   而我们的数据是普通 [Float] 数组。Swift 不做自动桥接，
+        //   手工 withUnsafe 拼指针极易写错（实测反复报错）。
+        //
+        // 改用 Swift overlay 的 vDSP.DFT（init 里已建好并复用）：
+        // 直接收发 [Float] 数组，类型安全、无指针体操。
+        // transformType = .realForward，对应原来的实数 FFT。
+        var dftReal = [Float](repeating: 0, count: fftSize / 2)
+        var dftImag = [Float](repeating: 0, count: fftSize / 2)
+        dft.transform(inputReal: realp, inputImaginary: [],
+                      outputReal: &dftReal, outputImaginary: &dftImag)
 
-                    // ① 交织 → 分离（stride 2：跳过每个复数里的虚部）
-                    var split = DSPSplitComplex(realp: rb, imagp: ib)
-                    vDSP_ctoz(rpb, 2, &split, 1, vDSP_Length(half))
-
-                    // ② 原地实数 FFT（就地修改 split 指向的两个数组）
-                    vDSP_fft_zrip(fftSetup, &split, 1, vDSP_Length(half),
-                                  FFTDirection(FFT_FORWARD))
-
-                    // ③ 分离 → 交织，写回 realp（幅度计算要用交错格式）
-                    vDSP_ztoc(&split, 1, rpb, 1, vDSP_Length(half))
-                }
-            }
-        }
-
-        // 幅度谱 = sqrt(re² + im²)
-        // vDSP_zvabs 只接受 DSPSplitComplex 指针，不接受交织的 Float*。
-        // 而 vDSP_zvmags 接受交织的 DSPComplex 格式 —— 用它更省事。
-        realp.withUnsafeBufferPointer { rp in
-            mags.withUnsafeMutableBufferPointer { mb in
-                guard let rpb = rp.baseAddress, let mp = mb.baseAddress else { return }
-                vDSP_zvmags(rpb, 1, mp, 1, vDSP_Length(half))
-            }
+        // 幅度谱 = sqrt(re² + im²)，只需前 half 个点
+        var mags = [Float](repeating: 0, count: half)
+        for i in 0..<half {
+            mags[i] = sqrt(dftReal[i] * dftReal[i] + dftImag[i] * dftImag[i])
         }
 
         // ── 趋势检测 ──
