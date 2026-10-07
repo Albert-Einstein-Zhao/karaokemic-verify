@@ -70,9 +70,9 @@ final class HowlingSuppressor {
     private var energyHistory: [Float]
     /// 频谱分析用的窗口函数（汉宁窗，减少频谱泄漏）
     private var window: [Float]
-    /// vDSP.DFT 计划（Swift overlay，值类型）。
-    /// ★ 在 init 里创建一次复用，不要每帧 new —— DFT 内部会分配内存。
-    private let dft: vDSP.DFT<Float>
+    /// vDSP 离散傅里叶变换计划（Swift overlay，值类型，无需手工销毁）。
+    /// 在 init 里创建一次复用，不要每帧 new —— 内部会分配内存。
+    private let dft: vDSP.DiscreteFourierTransform<Float>
     /// overlap-add 用的重叠区
     private var overlap: [Float]
 
@@ -100,10 +100,22 @@ final class HowlingSuppressor {
         // 它是值类型，创建一次复用，避免每帧分配内存。
         // .realForward = 实数输入的单边谱变换，正好对应原来的 fft_zrip。
         // 512 是 2 的幂，DFT 支持；force unwrap 安全。
-        self.dft = vDSP.DFT(count: fftSize,
-                            direction: .forward,
-                            transformType: .realForward,
-                            ofType: Float.self)!
+        // ★ vDSP 的实数 FFT 在 Swift overlay 里不叫 realForward ——
+        //   DFTTransformType 只有 .complexComplex 和 .complexReal 两个 case。
+        //   .complexReal 才是「实数输入 → 复数输出」的单边谱变换。
+        //
+        // ★ 用 DiscreteFourierTransform 而不是 vDSP.DFT ——
+        //   vDSP.DFT 类已标记 deprecated，新代码统一用 DiscreteFourierTransform。
+        //   它的 init 是 throws（可能因参数非法失败），512 是合法长度。
+        //
+        //   count 参数是「复数元素个数」。对 .complexReal，
+        //   实数输入长度需为 2×count，所以传 fftSize/2 = 256。
+        self.dft = try! vDSP.DiscreteFourierTransform(
+            count: fftSize / 2,
+            direction: .forward,
+            transformType: .complexReal,
+            ofType: Float.self
+        )
 
         self.energyHistory = [Float](repeating: 0, count: binCount)
         self.overlap = [Float](repeating: 0, count: hopSize)
@@ -123,9 +135,8 @@ final class HowlingSuppressor {
         self.notches = notches
     }
 
-    deinit {
-        vDSP_destroy_fftsetup(fftSetup)
-    }
+    // 不需要 deinit：DiscreteFourierTransform 是 Swift 值类型，
+    // 不持有需手工销毁的 OpaquePointer（那是老vDSP_fft_zrip 的做法）。
 
     // MARK: - 主处理
 
@@ -154,15 +165,21 @@ final class HowlingSuppressor {
         let start = n - hopSize
         guard start >= 0 else { return }
 
-        // 交织实数输入：realp[2k]=实部, realp[2k+1]=虚部，长度 fftSize
-        var realp = [Float](repeating: 0, count: fftSize)
+        // ── 加窗 ──
+        //
+        // vDSP.DiscreteFourierTransform 的 .complexReal 模式是 split-complex：
+        // 实部数组和虚部数组等长（各 count = fftSize/2）。
+        // 而我们的信号是纯实数，所以虚部全0。
+        // 这样输入总点数 = fftSize，与设计一致。
         let half = fftSize / 2
+        var inReal = [Float](repeating: 0, count: half)
+        var inImag = [Float](repeating: 0, count: half)
 
         // 窗口要用的是「窗的后 hopSize 段」，对应连续分析的重叠区
         let windowStart = fftSize - hopSize
         buf.withUnsafeBufferPointer { src in
             window.withUnsafeBufferPointer { win in
-                realp.withUnsafeMutableBufferPointer { dst in
+                inReal.withUnsafeMutableBufferPointer { dst in
                     guard let sb = src.baseAddress, let wb = win.baseAddress,
                           let db = dst.baseAddress else { return }
                     vDSP_vmul(sb.advanced(by: start), 1,
@@ -180,17 +197,15 @@ final class HowlingSuppressor {
         //   而我们的数据是普通 [Float] 数组。Swift 不做自动桥接，
         //   手工 withUnsafe 拼指针极易写错（实测反复报错）。
         //
-        // 改用 Swift overlay 的 vDSP.DFT（init 里已建好并复用）：
-        // 直接收发 [Float] 数组，类型安全、无指针体操。
-        // transformType = .realForward，对应原来的实数 FFT。
-        var dftReal = [Float](repeating: 0, count: fftSize / 2)
-        var dftImag = [Float](repeating: 0, count: fftSize / 2)
-        dft.transform(inputReal: realp, inputImaginary: [],
-                      outputReal: &dftReal, outputImaginary: &dftImag)
+        // 改用 DiscreteFourierTransform 的 split-complex 变体签名：
+        //   transform(real:imaginary:) -> (real: [Float], imaginary: [Float])
+        // 直接收发数组，类型安全、无指针体操。
+        let (dftReal, dftImag) = dft.transform(real: inReal, imaginary: inImag)
 
-        // 幅度谱 = sqrt(re² + im²)，只需前 half 个点
-        var mags = [Float](repeating: 0, count: half)
-        for i in 0..<half {
+        // 幅度谱 = sqrt(re² + im²)
+        // .complexReal 输出是共轭对称的，只需前 half 个有效点
+        var mags = [Float](repeating: 0, count: binCount)
+        for i in 0..<binCount {
             mags[i] = sqrt(dftReal[i] * dftReal[i] + dftImag[i] * dftImag[i])
         }
 
