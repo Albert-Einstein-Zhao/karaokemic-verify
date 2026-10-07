@@ -104,6 +104,43 @@ git push -u origin main
 4. 生成后复制那串`ghp_...`，粘贴到密码框（终端里粘贴后不显示，是正常的）
 5. 复制后立刻关掉那个网页，token 只显示这一次
 
+> 💡 **更省事的办法**：如果电脑上装了 [GitHub CLI](https://cli.github.com/)，
+> 一条命令建仓库 + 推送全搞定，连密码都不用输：
+>
+> ```bash
+> gh auth login                              # 一次性登录
+> gh repo create karaokemic-verify --public --source=. --remote=origin --push
+> ```
+>
+> `--public` 很关键：公开仓库的 Actions 免费额度**无限**，
+> 私有仓库只有每月 2000 分钟（macOS 还要按 10 倍系数折算）。
+
+### ⚠️ 常见错误：用户名填错
+
+```
+remote: Repository not found
+fatal: 'origin' does not appear to be a git remote
+```
+
+这通常不是仓库不存在，而是 **`origin` 里的用户名和你登录的账号不是同一个**。
+用 `gh auth status` 确认当前登录的是哪个账号，然后核对 remote 地址：
+
+```bash
+gh auth status                # 看 "Logged in to github.com account XXX"
+git remote -v                 # 看origin 里的用户名
+```
+
+改法：
+
+```bash
+git remote set-url origin https://github.com/正确的用户名/karaokemic-verify.git
+git push -u origin main
+```
+
+> 本项目实测踩过：登录账号是 `Albert-Einstein-Zhao`，
+> remote 却写成了 `eviloooolive/karaokemic-verify`（另一个账号），
+> 结果 `Could not resolve to a Repository`。**用户名务必以 `gh auth status` 为准。**
+
 ---
 
 # ──────────────────────────────────────────────────────────────────────
