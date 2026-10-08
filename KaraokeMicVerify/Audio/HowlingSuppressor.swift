@@ -225,8 +225,16 @@ final class HowlingSuppressor {
         var candidates: [(bin: Int, freq: Float, energy: Float)] = []
 
         // 只在 150Hz ~ 12kHz 搜索（人声+常见啸叫区）
-        let minBin = max(1, Int(150 / binHz))
-        let maxBin = min(binCount - 2, Int(12000 / binHz))
+        //
+        // ★ 双重夹逼：除了上限，还要保证不超过 DFT 实际输出的长度。
+        //   .complexReal 且 count = fftSize/2 时，输出实/虚数组长度各为 fftSize/2，
+        //   有效频点只有一半（另一半是共轭对称副本）。
+        //   一旦这里算出超过 mags.count 的下标，就会越界崩溃。
+        let availableBins = min(binCount, mags.count, energyHistory.count)
+        let minBin = max(1, min(Int(150 / binHz), availableBins - 2))
+        let maxBin = min(availableBins - 2, Int(12000 / binHz))
+
+        if minBin >= maxBin { return }        // 搜索区间为空，直接跳过本帧
 
         for bin in minBin..<maxBin {
             let cur = mags[bin]

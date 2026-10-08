@@ -99,14 +99,32 @@ final class VerifyViewModel: ObservableObject {
         sentFrames = 0
     }
 
+    /// 等麦克风权限真正落地后再启动引擎。
+    ///
+    /// ★ 这里为什么必须 async：
+    ///   `requestRecordPermission` 是**异步**的，弹窗要等用户点「好」才回调。
+    ///   原来在ensure() 里同步调用它、不等结果就立刻 `audio.start()`，
+    ///   于是 installTap 在「权限尚未授予」时执行 →
+    ///   CoreAudio 直接抛 Objective-C 异常
+    ///   `required condition is false: format.sampleRate == 0`
+    ///   → Swift 的 do/catch 抓不住 NSException → **闪退**。
+    ///   这就是「一点连接就退出」的根因（只在真机复现，模拟器抓不到）。
     private func startAudio() {
-        do {
-            try AVAudioSessionPermission.ensure()
-            try audio.start()
-            isConnected = true
-        } catch {
-            network.disconnect()
-            errorMessage = "麦克风启动失败：\(error.localizedDescription)"
+        Task { @MainActor in
+            let granted = await AVAudioSessionPermission.ensure()
+            guard granted else {
+                network.disconnect()
+                errorMessage = "麦克风权限被拒绝。请到「设置 → 雪宝 K歌麦」里打开。"
+                return
+            }
+            do {
+                try audio.start()
+                isConnected = true
+                errorMessage = nil
+            } catch {
+                network.disconnect()
+                errorMessage = "麦克风启动失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -147,18 +165,30 @@ final class VerifyViewModel: ObservableObject {
 // ══════════════════════════════════════════════════════════════════════
 
 enum AVAudioSessionPermission {
-    static func ensure() throws {
-        let session = AVAudioSession.sharedInstance()
-        let granted = session.recordPermission
 
-        if granted == .denied {
-            throw NSError(domain: "Permission", code: -1, userInfo: [
-                NSLocalizedDescriptionKey: "麦克风权限被拒绝。请到「设置 → 雪宝 K歌麦」里打开。"
-            ])
-        }
-        if granted == .undetermined {
-            session.requestRecordPermission { _ in }
-            // 第一次会弹窗，第二次点连接就已有权限
+    /// 确保麦克风权限已授予，**返回 true 才允许启动音频引擎**。
+    ///
+    /// - 已授权：立即返回 true
+    /// - 未询问：弹系统弹窗，等用户选择后返回其结果（async 挂起，不阻塞音频启动）
+    /// - 已拒绝：返回 false，调用方负责提示
+    static func ensure() async -> Bool {
+        let session = AVAudioSession.sharedInstance()
+
+        switch session.recordPermission {
+        case .granted:
+            return true
+        case .denied:
+            return false
+        case .undetermined:
+            // 关键：这里必须 await 到回调，拿到真实授权结果再返回。
+            // 旧实现 fire-and-forget 后立刻返回 true，导致引擎在无权限下启动 → 闪退。
+            return await withCheckedContinuation { continuation in
+                session.requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+        @unknown default:
+            return false
         }
     }
 }

@@ -99,7 +99,12 @@ final class AudioEngineController {
             ])
         }
 
-        // ★ 用 nil format 让系统用原生格式，避免强制转换导致的额外延迟/失真
+        // ★ 用 nil format 让系统用原生格式，避免强制转换导致的额外延迟/失真。
+        //   ⚠️ bufferSize 只是「建议值」：真机（尤其 iOS 17+）不保证严格按 240 回调，
+        //   常见实际值是 480(10ms) 或 960(20ms)。
+        //   而协议 frameCount 是 u8，上限 255 —— 若实际回调 > 255 帧，
+        //   AudioFrameBuilder 的 assert 会直接崩。
+        //   所以真正的防线在 process() 里的分片发送，不依赖这里的 bufferSize。
         input.installTap(onBus: 0,
                          bufferSize: AVAudioFrameCount(frameSize),
                          format: nil) { [weak self] buffer, _ in
@@ -160,10 +165,15 @@ final class AudioEngineController {
         // ★ 必须先 record 再 send：AEC 的参考信号要跟实际发出的内容一致
         signalChain.recordSentAudio(out.processed)
 
-        // ── 发送（frameCount 240 ≤ 255，不会截断）──
+        // ── 发送（分片，每片 ≤240 帧，永不触发协议断言）──
+        //
+        // ★ 为什么必须分片：
+        //   协议 frameCount 是 u8，上限 255。iOS 的 tap 回调长度不受控
+        //   （可能给 480/ 960 帧），直接整帧发出去会让
+        //   `UInt8(frameCount)` 静默回绕，或直接命中 assert。
+        //   按 240 帧切片后，每包头里的 frameCount 都是真实值。
         if network.state == .ready {
-            network.sendAudioFrame(samples: out.processed, sampleRate: UInt16(sampleRate))
-            sentFrames += 1
+            sendChunked(out.processed)
         }
 
         // ── 监测（每 3 帧刷一次 UI，降低刷新压力）──
@@ -190,6 +200,24 @@ final class AudioEngineController {
     }
 
     // MARK: - 参数
+
+    /// 把一帧音频切成 ≤240 帧的小包逐个发送。
+    ///
+    /// iOS 的 tap 回调长度不固定（240/480/960 都可能），
+    /// 而协议 frameCount 上限 255，所以必须切片。
+    private func sendChunked(_ samples: [Float]) {
+        let maxChunk = KaraokeProtocol.safeFrameCount      // 240
+        guard !samples.isEmpty else { return }
+
+        var offset = 0
+        while offset < samples.count {
+            let end = min(offset + maxChunk, samples.count)
+            network.sendAudioFrame(samples: Array(samples[offset..<end]),
+                                   sampleRate: UInt16(sampleRate))
+            sentFrames += 1
+            offset = end
+        }
+    }
 
     func updateParameters(_ p: SignalParameters) {
         signalChain.parameters = p

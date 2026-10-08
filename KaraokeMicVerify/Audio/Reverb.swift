@@ -241,8 +241,10 @@ final class Reverb {
         }
 
         // ── 梳状滤波器组：产生密集反射 ──
-        var wetSumL: Float = 0
-        var wetSumR: Float = 0
+        //每样本独立处理：梳状滤波器与全通滤波器都是逐样本递归的，
+        // 所以每个样本都要走一遍完整链路。
+        var wetL = [Float](repeating: 0, count: n)
+        var wetR = [Float](repeating: 0, count: n)
 
         for i in 0..<n {
             let inL = inputL[i]
@@ -259,25 +261,17 @@ final class Reverb {
                 combOutR += comb.processR(inR)
             }
 
-            wetSumL += combOutL
-            wetSumR += combOutR
-        }
-
-        // ── 全通滤波器组：修正梳状滤波的"染色"，让混响更自然 ──
-        var apOutL = wetSumL
-        var apOutR = wetSumR
-
-        for i in 0..<n {
-            var xL = wetSumL
-            var xR = wetSumR
+            // ── 全通滤波器组：修正梳状滤波的"染色"，让混响更自然 ──
+            var xL = combOutL
+            var xR = combOutR
 
             for ap in allpasses {
                 xL = ap.process(xL)
                 xR = ap.process(xR)      // 简化：左右共用滤波系数，差异来自前面的预延迟
             }
 
-            apOutL = xL
-            apOutR = xR
+            wetL[i] = xL
+            wetR[i] = xR
         }
 
         // ── 干湿混合 ──
@@ -287,14 +281,14 @@ final class Reverb {
 
         for i in 0..<n {
             // 立体声宽度：width=0 → 左右相同（单声道化）；width=1 → 完全展开
-            let mid = (apOutL + apOutR) * 0.5
-            let side = (apOutL - apOutR) * 0.5 * params.width
+            let mid = (wetL[i] + wetR[i]) * 0.5
+            let side = (wetL[i] - wetR[i]) * 0.5 * params.width
 
-            let wetL = mid + side
-            let wetR = mid - side
+            let outWetL = mid + side
+            let outWetR = mid - side
 
-            result[i * 2]     = dry * outL[i] + wet * wetL
-            result[i * 2 + 1] = dry * outR[i] + wet * wetR
+            result[i * 2]     = dry * outL[i] + wet * outWetL
+            result[i * 2 + 1] = dry * outR[i] + wet * outWetR
         }
 
         return result

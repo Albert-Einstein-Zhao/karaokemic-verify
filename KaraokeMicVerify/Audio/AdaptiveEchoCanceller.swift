@@ -112,14 +112,27 @@ final class AdaptiveEchoCanceller {
             return 0
         }
 
-        // 窗口长度对齐（reference 可能因为网络抖动略短）
-        let refLen = min(reference.count, taps)
-        guard refLen == taps else {
-            // 参考信号长度异常（连接初期），本次不处理
-            return erleDb
+        // 窗口长度对齐。
+        // ★ 这里原来写的是 `guard refLen == taps else { return }`：
+        //   taps = 512，但每帧参考信号只有 240 个样本（5ms），
+        //   240 ≠ 512 → 永远命中 guard 直接 return → **AEC 从来没真正工作过**，
+        //   UI 上的 ERLE 恒为 0，且回声一点没消。
+        //
+        //   正确做法：AEC 是**逐样本**递归滤波器，用滤波器自身的历史窗口 xHistory
+        //   承载「过去的参考样本」，只需要当前帧的新样本。
+        //   所以这里不该要求 reference 长度等于 taps，只要求非空。
+        guard !reference.isEmpty else { return erleDb }
+
+        // 把本帧参考样本推进历史窗口（新的在前）
+        if reference.count >= taps {
+            //极端情况：参考比滤波器还长，只取最近 taps 个
+            xHistory = Array(reference.suffix(taps))
+        } else {
+            xHistory.removeFirst(reference.count)
+            xHistory.append(contentsOf: reference)
         }
 
-        // ── 1. 预测回声：y[i] = Σ h[k] · reference[i - k] ──
+        // ── 1. 预测回声：y[i] = Σ h[k] · xHistory[i - k] ──
         //
         // ★ 这里原来写的是 vDSP_dotpr —— 那是「点积」函数，
         //   返回一个标量（Float），不能用来生成逐点预测序列。
@@ -127,7 +140,7 @@ final class AdaptiveEchoCanceller {
         // 也考虑过改用 vDSP_conv（真正的卷积函数），但它有两个硬约束：
         //   ① 输入信号长度必须 ≥ lenResult + lenFilter - 1，即需要零填充
         //   ② 每次调用都要构造填充后的临时数组
-        // 在 5ms 一帧的实时音频回调里，第②条是禁忌（堆分配会造���爆音）。
+        // 在 5ms 一帧的实时音频回调里，第②条是禁忌（堆分配会造成爆音）。
         //
         // 所以用标量循环。开销核算：
         //   240 样本 × 512 taps ≈ 12.3 万次乘加，每 5ms 执行一次
@@ -135,10 +148,12 @@ final class AdaptiveEchoCanceller {
         var yEstimate = [Float](repeating: 0, count: n)
         for i in 0..<n {
             var acc: Float = 0
-            // h[k] 对应参考信号里往前数第 k 个样本
-            let upper = min(taps, i + 1)
+            // h[k] 对应参考信号里往前数第 k 个样本。
+            // 本帧新样本的偏移是 taps-n，所以 i 点的参考起点要往后挪 taps-n。
+            let base = taps - n
+            let upper = min(taps, i + base + 1)
             for k in 0..<upper {
-                acc += h[k] * reference[i - k]
+                acc += h[k] * xHistory[i + base - k]
             }
             yEstimate[i] = acc
         }
@@ -177,7 +192,7 @@ final class AdaptiveEchoCanceller {
         // → 用户正在唱歌（近端语音）→ 此时若继续更新系数，
         //   滤波器会试图去拟合用户的声音，导致回声消除崩掉。
         // → 冻结更新。这是双讲场景下 AEC 稳定的关键。
-        let refPower = power(of: reference)
+        let refPower = power(of: xHistory)
         recentRefPower = 0.7 * recentRefPower + 0.3 * refPower
         recentErrPower = 0.7 * recentErrPower + 0.3 * errPower
 
@@ -189,17 +204,19 @@ final class AdaptiveEchoCanceller {
         // 归一化（除以输入能量）保证不同音量下收敛速度一致。
         if !doubleTalk {
             let eps: Float = 1e-7
-            let norm = refPower + eps
+            // 归一化用整段参考的功率
+            let norm = power(of: xHistory) + eps
             // 有效步长受强度滑块控制
             let effectiveMu = mu * strength
 
-            // 只用最近的 taps 点做更新，避免整帧长度与 taps 不匹配
-            let updateLen = min(n, taps)
-            for k in 0..<updateLen {
-                let gain = effectiveMu * err[k] / norm
+            // 只更新与本帧样本相关的系数段（长度 = 本帧样本数）
+            let base = taps - n
+            for i in 0..<n {
+                let k = base + i          // 本帧第 i 个样本对应的滤波器抽头
+                guard k >= 0, k < taps else { continue }
+                let gain = effectiveMu * err[i] / norm
                 if gain.isFinite, abs(gain) < 10 {
-                    // h[k] += gain * x[n-1-k]
-                    h[k] += gain * reference[n - 1 - k]
+                    h[k] += gain * xHistory[i]
                     // 稳定性钳位：|h| > 1.5 物理上不可能是房间反射
                     if abs(h[k]) > 1.5 { h[k] = h[k] > 0 ? 1.5 : -1.5 }
                 }

@@ -32,6 +32,11 @@ struct ContentView: View {
                     // ── IP 输入 + 连接 ──
                     ipSection
 
+                    // ── 错误提示（权限被拒/ 引擎启动失败等）──
+                    if let msg = vm.errorMessage {
+                        errorBanner(msg)
+                    }
+
                     // ── 关键指标 ──
                     if vm.isNetworkReady {
                         metricsSection
@@ -46,6 +51,29 @@ struct ContentView: View {
                 .padding(20)
             }
         }
+    }
+
+    // MARK: - 错误提示
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 15))
+
+            Text(message)
+                .font(.system(size: 13))
+                .foregroundStyle(.white)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.orange.opacity(0.4), lineWidth: 0.5)
+        )
     }
 
     // ══════════════════════════════════════════════════════════════
