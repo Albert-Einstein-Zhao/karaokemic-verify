@@ -124,12 +124,17 @@ final class AdaptiveEchoCanceller {
         guard !reference.isEmpty else { return erleDb }
 
         // 把本帧参考样本推进历史窗口（新的在前）
+        //
+        // ★ 防御性收窄：即使 n 超大，也不让 removeFirst 传超界数量。
+        //   removeFirst(k) 在 k > count 时会 trap（崩溃），
+        //   虽��上面的分支已保证 k < taps，这里再夹一次，纯属兜底。
         if reference.count >= taps {
-            //极端情况：参考比滤波器还长，只取最近 taps 个
+            // 极端情况：参考比滤波器还长，只取最近 taps 个
             xHistory = Array(reference.suffix(taps))
         } else {
-            xHistory.removeFirst(reference.count)
-            xHistory.append(contentsOf: reference)
+            let drop = min(reference.count, xHistory.count)
+            if drop > 0 { xHistory.removeFirst(drop) }
+            xHistory.append(contentsOf: reference.suffix(taps))
         }
 
         // ── 1. 预测回声：y[i] = Σ h[k] · xHistory[i - k] ──
@@ -146,14 +151,22 @@ final class AdaptiveEchoCanceller {
         //   240 样本 × 512 taps ≈ 12.3 万次乘加，每 5ms 执行一次
         //   ≈ 24.6 M 次乘加/秒，A13 及以后单核占用约 2.5%，完全可接受。
         var yEstimate = [Float](repeating: 0, count: n)
+        // ★ base 同样必须夹紧。
+        //   n > taps 时 base 为负 → i + base 可能为负 → xHistory[负数] 越界崩溃。
+        //   夹到 0 后语义是「把本帧样本当作滤波器最近 taps 个输入的延续」，
+        //   对 n > taps 的超长帧是合理降级（多出来的样本用最近的历史对齐）。
+        let base = max(0, taps - n)
         for i in 0..<n {
             var acc: Float = 0
             // h[k] 对应参考信号里往前数第 k 个样本。
             // 本帧新样本的偏移是 taps-n，所以 i 点的参考起点要往后挪 taps-n。
-            let base = taps - n
-            let upper = min(taps, i + base + 1)
+            // upper 同时受 taps 夹逼，保证 i + base - k >= 0。
+            let idxStart = min(i + base, taps - 1)
+            let upper = min(taps, idxStart + 1)
             for k in 0..<upper {
-                acc += h[k] * xHistory[i + base - k]
+                let idx = idxStart - k
+                if idx < 0 { break }
+                acc += h[k] * xHistory[idx]
             }
             yEstimate[i] = acc
         }
@@ -209,9 +222,23 @@ final class AdaptiveEchoCanceller {
             // 有效步长受强度滑块控制
             let effectiveMu = mu * strength
 
-            // 只更新与本帧样本相关的系数段（长度 = 本帧样本数）
-            let base = taps - n
-            for i in 0..<n {
+            // ★★ 必须夹紧 base，base 为负会直接导致数组越界崩溃 ★★
+            //
+            // 原本写的是 `let base = taps - n`，当回调帧数 n > taps 时 base 变负数：
+            //   · NLMS 里 `h[k]` 有 guard k>=0 保护，会 continue 跳过（不崩）
+            //   · 但 `xHistory[i]` 里的 i 是本帧样本下标（0..<n），
+            //     n=960 时 i 会到 959，直接访问 xHistory[512..959] → **越界崩溃**
+            //
+            // 真实触发场景：iOS 的 installTap(bufferSize:) 只是「建议值」，
+            // 真机（尤其 iOS 17+）常给 480/ 960 帧。
+            // 表现：点连接 → 界面切换 → 不到半秒闪退（音频回调开始跑就炸）。
+            //
+            // 修法：base 夹到 [0, taps]，且只更新本帧真正对得上的那一段抽头。
+            // 被跳过的样本由下一次调用继续覆盖，不影响算法正确性
+            //（NLMS 本来就是逐样本递归，分几段更新等价）。
+            let base = max(0, taps - n)
+            let kMax = min(n, taps - base)      // 本帧最多能更新多少个抽头
+            for i in 0..<kMax {
                 let k = base + i          // 本帧第 i 个样本对应的滤波器抽头
                 guard k >= 0, k < taps else { continue }
                 let gain = effectiveMu * err[i] / norm

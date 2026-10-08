@@ -248,8 +248,14 @@ final class HowlingSuppressor {
             let ratio = cur / hist
 
             // 窄带判定：左右邻域显著低于当前峰
+            //
+            // ★ 上界必须用 mags.count - 1，不能用 binCount - 1。
+            //   binCount 是「名义」频点数（fftSize/2 = 256），
+            //   而 mags 是按 DFT 实际输出长度分配的，两者不一定相等。
+            //   用 binCount 当上界，一旦实际输出更短就会 mags[越界] 崩溃。
+            let lastIdx = mags.count - 1
             let leftDrop = mags[max(bin - 3, 0)]
-            let rightDrop = mags[min(bin + 3, binCount - 1)]
+            let rightDrop = mags[min(bin + 3, lastIdx)]
             let isNarrowBand = cur > leftDrop * 3 && cur > rightDrop * 3
 
             if ratio > prominenceRatio && isNarrowBand {
