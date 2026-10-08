@@ -120,7 +120,11 @@ final class SignalChain {
         self.reverb = Reverb(sampleRate: sampleRate, parameters: .default)
 
         // AEC 参考环形缓冲：512 taps + 一点余量
-        self.referenceRing = [Float](repeating: 0, count: 1024)
+        // ★ 2026-10-08 从 1024 扩到 4096：
+        //   原来 1024 装不下 40ms 对齐量（1920 样本），
+        //   取模后静默降级成 18.7ms，注释宣称的 40ms 从未生效。
+        //   4096 ≥ 1920 + 最大帧长 960，且是 2 的幂，取模开销低。
+        self.referenceRing = [Float](repeating: 0, count: 4096)
 
         self.scratchBuffer = [Float](repeating: 0, count: frameSize * 2)
         self.processedBuffer = [Float](repeating: 0, count: frameSize * 2)
@@ -254,9 +258,26 @@ final class SignalChain {
         var ref = [Float](repeating: 0, count: n)
         let ringSize = referenceRing.count
 
+        // ★★ 两个 bug（2026-10-08 第十轮审查发现）
+        //
+        // (a) 容量不足：原来 referenceRing 只有 1024，
+        //     而 alignmentSamples = 48000*0.040 = 1920。
+        //     环形缓冲最多只能回溯 1023 样本(21.3ms)，
+        //     1920 % 1024 = 896 → 实际对齐量被静默降级成 ~18.7ms，
+        //     注释/documentation 宣称的 40ms 从来没真正生效。
+        //     → 现已在 init 里把环扩到 4096（≥1920 + 最大帧长 960）。
+        //
+        // (b) 符号错误：原来索引里是 `- i`，意味着参考信号在帧内**时间倒放**。
+        //     mic 的第 i 个样本对应时刻 t0+i，
+        //     它该配的参考样本是 t0+i-Δ（更早），在环里的位置应随 i **递增**：
+        //         环中 w-1 对应 t0
+        //         t0+i-Δ 距 t0 为 (i-Δ)，位置 = (w-1 + i - Δ) mod ringSize
+        //     → 正确写法是 `+ i`，不是 `- i`。
+        //     符号反了会导致滤波器无法拟合回声路径（AEC 结构性失效）。
+
         for i in 0..<n {
-            // 从「当前写指针 - alignmentSamples」往回读
-            let readIndex = ((referenceWriteIndex - alignmentSamples - 1 - i) % ringSize + ringSize) % ringSize
+            // 从「当前写指针 - alignmentSamples」往回读，随 i 递增
+            let readIndex = ((referenceWriteIndex - alignmentSamples - 1 + i) % ringSize + ringSize) % ringSize
             ref[i] = referenceRing[readIndex]
         }
 

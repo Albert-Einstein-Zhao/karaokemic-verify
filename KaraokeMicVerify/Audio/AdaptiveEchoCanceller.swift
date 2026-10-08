@@ -173,12 +173,37 @@ final class AdaptiveEchoCanceller {
 
         // ── 2. 误差信号：e[n] = mic[n] - yEstimate[n] ──
         // 这个 e 就是「减去回声后的干净人声」
+        //
+        // ★★★ 严重 bug（2026-10-08 第十轮审查发现，此前一直存在）
+        //
+        // 原来写的是：
+        //     mic.withUnsafeMutableBufferPointer { m in
+        //         yEstimate.withUnsafeBufferPointer { y in
+        //             vDSP_vsub(mb, 1, yb, 1, mb, 1, vDSP_Length(n))   // ← 输出写进 mb
+        //         }
+        //     }
+        //
+        // vDSP_vsub 的第 5 个参数是**输出**指针，这里传的是 `mb`（mic 的buffer），
+        // 也就是说误差被写回了 mic，而 `err` 数组**从头到尾没有被赋值过**，
+        // 一直是全零。
+        //
+        // 连锁后果（全部静默失效，比闪退更难发现）：
+        //   ① `mic = err` → AEC 输出整段数字静音，UDP 发出的是纯0
+        //   ② errPower 恒 0 → 散度保护 `errPower > micPower*9` 恒 false → 永不触发
+        //   ③ refPower>0 而 recentErrPower 恒 0 → farEndOnly 恒 true
+        //      → doubleTalk 恒 false → 双讲检测永不冻结系数（唱歌时滤波器会去拟合人声）
+        //   ④ gain = mu*err[i]/norm 恒 0 → h[k] += 0 → NLMS 从未更新过一次
+        //
+        // 修法：输出必须写到 `err`。
         var err = [Float](repeating: 0, count: n)
         mic.withUnsafeMutableBufferPointer { m in
             yEstimate.withUnsafeBufferPointer { y in
-                guard let mb = m.baseAddress, let yb = y.baseAddress else { return }
-                // vDSP_vsub只吃裸指针，不接受数组/切片
-                vDSP_vsub(mb, 1, yb, 1, mb, 1, vDSP_Length(n))
+                err.withUnsafeMutableBufferPointer { e in
+                    guard let mb = m.baseAddress, let yb = y.baseAddress,
+                          let eb = e.baseAddress else { return }
+                    // vDSP_vsub 只吃裸指针，不接受数组/切片
+                    vDSP_vsub(mb, 1, yb, 1, eb, 1, vDSP_Length(n))
+                }
             }
         }
 
@@ -239,13 +264,26 @@ final class AdaptiveEchoCanceller {
             let base = max(0, taps - n)
             let kMax = min(n, taps - base)      // 本帧最多能更新多少个抽头
             for i in 0..<kMax {
-                let k = base + i          // 本帧第 i 个样本对应的滤波器抽头
-                guard k >= 0, k < taps else { continue }
+                // ★ 抽头与输入的配对必须与【预测循环】完全一致。
+                //
+                //   预测循环里：抽头 k 配对的是 xHistory[idxStart - k]，
+                //   其中 idxStart = min(i + base, taps - 1)。
+                //
+                //   原写法 `h[base + i] += gain * xHistory[i]` 有两处错：
+                //     ① 抽头下标比预测时多了 i → off-by-i
+                //     ② 读 xHistory[i] 而不是预测时用的那个输入
+                //        → 数学上等价于「用错输入更新抽头」，
+                //          结果是抽头 0..base-1 永远不会被更新（n=240 时 0..271 全是 0），
+                //          有效滤波器只有 240 阶而不是 512 阶。
+                let idxStart = min(i + base, taps - 1)
+                guard kMax > 0, idxStart < taps else { continue }
                 let gain = effectiveMu * err[i] / norm
                 if gain.isFinite, abs(gain) < 10 {
-                    h[k] += gain * xHistory[i]
-                    // 稳定性钳位：|h| > 1.5 物理上不可能是房间反射
-                    if abs(h[k]) > 1.5 { h[k] = h[k] > 0 ? 1.5 : -1.5 }
+                    // 逐抽头更新：用与预测时相同的输入样本 xHistory[idxStart]
+                    for k in 0...min(idxStart, taps - 1) {
+                        h[k] += gain * xHistory[idxStart - k]
+                        if abs(h[k]) > 1.5 { h[k] = h[k] > 0 ? 1.5 : -1.5 }
+                    }
                 }
             }
         }
