@@ -127,6 +127,25 @@ struct PacketHeader {
 
 enum AudioFrameBuilder {
 
+    /// 输出增益（线性）。
+    ///
+    /// ★ 为什么是 1.0（2026-10-08 第十三轮，两次误判的记录）
+    ///
+    ///   我一度判断「Int16 量化把信号全截断成 0」，准备加 12 倍补偿。
+    ///   **事后用数值验证，这个判断是错的**：
+    ///     Float 0.01 × 32768 = 328     → 远大于最小非零值 1
+    ///     Float 0.001 × 32768 = 32.8   → 也够
+    ///     iPhone 麦克风正常说话 0.01~0.1 → Int16 值 328~3277，绰绰有余
+    ///   盒子端显示阈值 rms > 1e-6，对应 Float 幅度约 0.001（-60 dBFS），
+    ///   而麦克风幅度高出 10~100 倍，**根本不会触发全零**。
+    ///
+    ///   真实根因是盒子端**缺少播放器线程**（jitterBuffer.read() 零调用），
+    ///   与量化无关。已改在 ReceiverService 里修。
+    ///
+    ///   所以这里保持 1.0。如果将来确认盒子端偏小，
+    ///   应该改「输入增益」滑块（有UI + 文档），而不是偷偷改协议层。
+    static let outputGain: Float = 1.0
+
     /// Float 采样（-1~1）→ PCM S16LE + 帧头
     ///
     /// ⚠️ 硬断言：frameCount 超过 255 直接触发 fatalError。
@@ -158,20 +177,32 @@ enum AudioFrameBuilder {
 
         // Float → Int16（PCM S16LE）
         //
-        // ★ 这里踩过两个坑：
-        //  ① 原来写 vDSP_vclip —— 签名是 (const Float*,…,Float*,…) 全 Float，
-        //     用它写进 [Int16] 是类型错误。
-        //  ② 改 vDSP_vfixu 也不对 —— 带 u 的是**无符号** UInt16 版本。
-        //     有符号 Int16 的函数名是 vDSP_vfix16（无 u）。
+        // ★★★ 关键修复（2026-10-08 第十三轮）：舍入方式 + 一次误判的记录
         //
-        // 用 Swift 的 vDSP overlay 更简洁，等价且类型安全：
-        //   vDSP.floatingPointToInteger(_:integerType:rounding:)
-        // 需要 iOS 13+（本工程部署目标 15.0，满足）。
-        // 超出范围的样本自动饱和钳位（不回绕），正是我们要的行为。
+        // ① 舍入改成 .toNearestEven（四舍五入）而不是 .towardZero（截断）
+        //    截断时 Float 0.6 → Int16 0（直接丢掉）；
+        //    四舍五入 Float 0.6 → Int16 1（保留）。
+        //    对大信号两者没差别，但对**小信号**是「有」和「无」的区别。
+        //
+        // ② 曾误判「需要 12 倍增益补偿」，用数值验证后确认**是错的**：
+        //      Float 0.01 × 32768 = 328    → 远大于最小非零值 1
+        //      Float 0.001 × 32768 = 32.8  → 也够
+        //    iPhone 麦克风正常说话 0.01~0.1 → Int16 值 328~3277，绰绰有余。
+        //    盒子端阈值 rms > 1e-6 对应 Float 幅度约 0.001（-60 dBFS），
+        //    麦克风幅度高出 10~100 倍，**根本不会触发全零**。
+        //
+        //    真实根因是盒子端缺少播放器线程（jitterBuffer.read() 零调用），
+        //    与量化无关 —— 已改在 Android 的 ReceiverService 里修。
+        //
+        // 所以这里不加增益。outputGain 保持 1.0（见上方注释）。
+        let scaled = outputGain == 1.0
+            ? samples
+            : samples.map { $0 * outputGain }
+
         let int16Buffer = vDSP.floatingPointToInteger(
-            samples,
+            scaled,
             integerType: Int16.self,
-            rounding: .towardZero
+            rounding: .toNearestEven
         )
 
         // Int16 数组 → 小端字节流。

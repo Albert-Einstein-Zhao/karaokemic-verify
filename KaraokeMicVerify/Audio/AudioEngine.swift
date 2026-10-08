@@ -49,6 +49,13 @@ final class AudioEngineController {
     private(set) var frameCounter: Int = 0
     private(set) var sentFrames: Int = 0
 
+    /// ★ 新增（第十三轮）：Int16 量化之后真正发送的幅度（dBFS）。
+    ///
+    /// 用它替代「估一个放大后的电平」，因为只有它能回答
+    /// 「盒子里到底有没有收到非零数据」。
+    /// 计算方式：直接从 sendChunked 里回传真实的 Int16 样本统计。
+    private(set) var sentLevelDb: Float = -120
+
     /// 最近 60 帧电平（画波形用）
     private(set) var levelHistory: [Float] = Array(repeating: -60, count: 60)
 
@@ -228,6 +235,26 @@ final class AudioEngineController {
                                    sampleRate: UInt16(sampleRate))
             sentFrames += 1
             offset = end
+        }
+
+        // ★ 第十三轮：统计**真正进包的 Int16 样本**的幅度。
+        //   不能用 Float 估算 —— Float 有幅度不等于 Int16 有数据。
+        //   这里用与 AudioFrameBuilder.build 完全一致的转换，
+        //   保证「显示的」与「发出的」是同一份数据。
+        let gain = AudioFrameBuilder.outputGain
+        var sumSq: Float = 0
+        var nonZero = 0
+        for s in samples {
+            let v = Int16((s * gain).rounded())      // 与 build 里 .toNearestEven 一致
+            sumSq += Float(v) * Float(v)
+            if v != 0 { nonZero += 1 }
+        }
+        let rms = sqrt(sumSq / Float(samples.count)) / 32768.0
+        if nonZero == 0 {
+            // 一个非零样本都没有 → 全零包
+            sentLevelDb = -120
+        } else {
+            sentLevelDb = 20 * log10(max(rms, 1e-7))
         }
     }
 

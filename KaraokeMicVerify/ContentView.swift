@@ -161,6 +161,12 @@ struct ContentView: View {
 
             HStack(spacing: 12) {
                 // AEC 效果
+                //
+                // 判据说明（2026-10-08 修正）：
+                // 0 dB 且标注「未工作」= 滤波器一次都没跑（errPower 恒 0）。
+                // 但这个 0 与「盒子里有没有声音」**不是同一件事** ——
+                // ERLE 用量化前的 Float 算，电视收到的是Int16 量化后的值。
+                // 所以判断电视有没有声音，要看下面「发送电平」那一项。
                 smallMetric(
                     title: "AEC 抑制量",
                     value: String(format: "%.1f", vm.erle),
@@ -198,6 +204,23 @@ struct ContentView: View {
                     unit: "dB",
                     caption: vm.currentLevelDb > -90 ? (vm.isSinging ? "检测到人声" : "有信号") : "静音",
                     tint: vm.currentLevelDb > -50 ? .green : .gray
+                )
+
+                // ★ 新增（第十三轮）：量化后的实际发送电平
+                //
+                // 作用：一眼区分「麦克风没采到声音」和「采到了但链路断了」。
+                //
+                //   输入电平 = AEC 之前的 Float 幅度（麦克风采集到的）
+                //   发送电平 = Int16 量化**之后**真正进包的幅度
+                //
+                // 曾用它排查过「电视没声音」，结论是**盒子端缺播放器线程**，
+                // 与量化无关。但这个指标本身很有用，保留下来。
+                smallMetric(
+                    title: "发送电平",
+                    value: vm.sentLevelDb <= -100 ? "—" : String(format: "%.0f", vm.sentLevelDb),
+                    unit: "dB",
+                    caption: vm.sentLevelDb > -60 ? "有数据" : "全零",
+                    tint: vm.sentLevelDb > -60 ? .green : .red
                 )
             }
         }

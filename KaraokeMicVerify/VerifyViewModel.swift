@@ -34,6 +34,13 @@ final class VerifyViewModel: ObservableObject {
     @Published var howlingFreqs: [Float] = []
     @Published var isSinging = false
     @Published var sentFrames: Int = 0
+    /// ★ 新增（第十三轮）：Int16 量化**之后**真正发出去的幅度（dBFS）。
+    ///
+    /// 这是判断「电视有没有声音」的唯一可靠指标。
+    /// 与 `currentLevelDb`（AEC 之前的 Float）的区别：
+    /// 幅度低于 1/32768 的样本在 Int16 里会全部量化成 0，
+    /// 于是发出去的是纯零字节 —— 而输入电平看起来一切正常。
+    @Published var sentLevelDb: Float = -120
     @Published var levelHistory: [Float] = Array(repeating: -60, count: 60)
 
     // MARK: - DSP 参数（UI 直接改这些）
@@ -139,6 +146,7 @@ final class VerifyViewModel: ObservableObject {
         howlingFreqs = audio.howlingFreqs
         isSinging = audio.isSinging
         sentFrames = audio.sentFrames
+        sentLevelDb = audio.sentLevelDb
         levelHistory = audio.levelHistory
         if deviceName != network.deviceName {
             deviceName = network.deviceName
