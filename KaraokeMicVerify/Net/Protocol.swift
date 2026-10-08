@@ -199,10 +199,23 @@ enum AudioFrameBuilder {
             ? samples
             : samples.map { $0 * outputGain }
 
+        // ★ 舍入用 .towardNearestInteger（四舍五入），不是 .towardZero（截断）
+        //
+        //   截断时 Float 0.6 → Int16 0（直接丢掉）；
+        //   四舍五入 Float 0.6 → Int16 1（保留）。
+        //   对大信号两者没差别，但对**小信号**是「有」和「无」的区别。
+        //
+        // ⚠️⚠️ vDSP.RoundingMode 只有两个 case：
+        //      .towardNearestInteger
+        //      .towardZero
+        //   **没有** `.toNearestEven`（那是 Python round 的行为名，Swift 这边不一样）。
+        //   我第一次写成 .toNearestEven → CI 编译失败（run 37797973451）。
+        //   ★ 本机没有 Swift 工具链，这类基础 API 错误无法预先发现，
+        //     只能靠 WebSearch 核对 + CI 兜底。
         let int16Buffer = vDSP.floatingPointToInteger(
             scaled,
             integerType: Int16.self,
-            rounding: .toNearestEven
+            rounding: .towardNearestInteger
         )
 
         // Int16 数组 → 小端字节流。
