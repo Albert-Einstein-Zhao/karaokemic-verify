@@ -179,7 +179,19 @@ final class AudioEngineController {
         // ── 监测（每 3 帧刷一次 UI，降低刷新压力）──
         frameCounter += 1
         if frameCounter % 3 == 0 {
-            let level = out.outputLevelDb
+            // ★ 2026-10-08 修正：显示 **AEC 之前** 的输入电平。
+            //
+            //   原来用 out.outputLevelDb（AEC 之后的输出）：
+            //   AEC 一旦出问题（如曾经出现过的输出静音 bug），
+            //   这个读数就恒为 0，UI 上「输入电平」和波形全空，
+            //   **让人误以为麦克风坏了**。
+            //
+            //   改用 inputLevelDb 的意义：
+            //     - 它反映麦克风采集是否正常（与 AEC 无关）
+            //     - AEC 出问题时它仍正常 → 能立刻区分「麦克风坏了」vs「AEC 坏了」
+            //     - ERLE 的定义本身就是「输入回声 vs 残余回声」，
+            //       拿输入电平做参照才符合物理含义
+            let level = out.inputLevelDb
             let peak = max(peakLevelDb * 0.95, level)
             let erle = out.erleDb
             let howl = out.howling

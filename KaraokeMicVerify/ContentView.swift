@@ -183,11 +183,20 @@ struct ContentView: View {
                 )
 
                 // 电平
+                //
+                // ★ 2026-10-08 修正：caption 不能只看 isSinging。
+                //   isSinging 是 AEC 双讲检测的结果，而双讲检测在
+                //   errPower 恒为 0 时会永远返回 false → 于是
+                //   **电平明明在跳动，caption 却一直显示「静音」**
+                //   （2026-10-08 实机验证时踩到，极易误导排查方向）。
+                //
+                //   正确判据：直接看电平本身。
+                //   有信号却判定为静音 → 才是真的异常。
                 smallMetric(
                     title: "输入电平",
                     value: vm.currentLevelDb <= -100 ? "—" : String(format: "%.0f", vm.currentLevelDb),
                     unit: "dB",
-                    caption: vm.isSinging ? "检测到人声" : "静音",
+                    caption: vm.currentLevelDb > -90 ? (vm.isSinging ? "检测到人声" : "有信号") : "静音",
                     tint: vm.currentLevelDb > -50 ? .green : .gray
                 )
             }

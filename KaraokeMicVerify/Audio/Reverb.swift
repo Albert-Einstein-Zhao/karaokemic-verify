@@ -227,14 +227,25 @@ final class Reverb {
         var inputR = [Float](repeating: 0, count: n)
         var outL = [Float](repeating: 0, count: n)
         var outR = [Float](repeating: 0, count: n)
+        // ★ 新增：保留**未经预延迟**的原始干声
+        //
+        // 干湿混合时干声必须用「原始输入」，不能用预延迟后的信号。
+        // 原因：预延迟是 12ms（≈576 样本）的延迟线，
+        // 刚启动时缓冲里全是 0，前 12ms 干声会明显偏小；
+        // 更糟的是混响里 outL/outR 已经被写成延迟后的值，
+        // 拿它当干声会让干声整体后移 12ms，与湿声时间错位。
+        var dryL = [Float](repeating: 0, count: n)
+        var dryR = [Float](repeating: 0, count: n)
 
         // 预延迟 + 立体声展宽：右声道延迟略长 → 产生"空间展宽"感
         for i in 0..<n {
+            dryL[i] = samples[i]
+            dryR[i] = samples[i]
             inputL[i] = preDelayL.process(samples[i])
             inputR[i] = preDelayR.process(samples[i])
         }
 
-        // 干声直接拷贝
+        // 干声直接拷贝（延迟后的版本，供内部反馈路径使用）
         for i in 0..<n {
             outL[i] = inputL[i]
             outR[i] = inputR[i]
@@ -287,8 +298,9 @@ final class Reverb {
             let outWetL = mid + side
             let outWetR = mid - side
 
-            result[i * 2]     = dry * outL[i] + wet * outWetL
-            result[i * 2 + 1] = dry * outR[i] + wet * outWetR
+            // ★ 干声用**未经预延迟**的 dryL/dryR（见上方说明）
+            result[i * 2]     = dry * dryL[i] + wet * outWetL
+            result[i * 2 + 1] = dry * dryR[i] + wet * outWetR
         }
 
         return result
