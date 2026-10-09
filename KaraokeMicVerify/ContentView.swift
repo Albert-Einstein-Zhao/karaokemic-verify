@@ -368,7 +368,8 @@ struct ContentView: View {
             //   现在显示 vm.boxIP 的当前值，与输入框保持一致。
             Text("盒子 IP：\(vm.boxIP)")
                 .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.boxIPIsValid ? .cyan.opacity(0.8) : .orange)
+                // boxIPIsValid 是 ContentView 自己的计算属性，不是 vm 的成员
+                .foregroundStyle(boxIPIsValid ? Color.cyan.opacity(0.8) : Color.orange)
         }
         .padding(.top, 30)
     }
