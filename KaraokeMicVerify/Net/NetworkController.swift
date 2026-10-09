@@ -201,6 +201,18 @@ final class NetworkController {
         sendControl(msg)
     }
 
+    /// 主动通知盒子「我要断开」。
+    ///
+    /// ★ 为什么必须发（2026-10-09 用户实测现象）：
+    ///   手机断开后盒子仍显示「手机已连接」。原因是 UDP 没有断开事件，
+    ///   不发 bye 的话盒子只能靠「3 秒没收到音频包」的空闲超时才反应过来。
+    ///   发了 bye，盒子立刻复位，界面状态也就同步了。
+    func sendBye() {
+        let msg = ControlMessage.build(cmd: "bye",
+                                       data: ["clientName": UIDevice.current.name])
+        sendControl(msg)
+    }
+
     func sendControl(_ data: Data) {
         guard let conn = controlConnection else { return }
         conn.send(content: data, completion: .contentProcessed { _ in })

@@ -245,7 +245,16 @@ final class AudioEngineController {
         var sumSq: Float = 0
         var nonZero = 0
         for s in samples {
-            let v = Int16((s * gain).rounded())      // 与 build 里 .toNearestEven 一致
+            // ★ 与 AudioFrameBuilder.build 保持一致：
+            //   Float(-1~1) → Int16 **必须乘满量程 32767**，否则 0.03 会变成 0，
+            //   这个统计就会永远显示「全零」，把真正的量化 bug 掩盖掉。
+            //
+            // ⚠️ 必须手动 clamp：Swift 的 `Int16(someFloat)` 在超出范围时会
+            //    **直接 trap 崩溃**，而 vDSP.floatingPointToInteger 自带饱和裁剪。
+            //    两边行为不一致，这里不 clamp 就有闪退风险。
+            let scaled = s * gain * Float(Int16.max)
+            let clamped = max(-32768.0, min(32767.0, scaled))
+            let v = Int16(clamped.rounded())
             sumSq += Float(v) * Float(v)
             if v != 0 { nonZero += 1 }
         }

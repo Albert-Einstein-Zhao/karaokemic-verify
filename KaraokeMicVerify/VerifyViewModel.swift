@@ -158,6 +158,21 @@ final class VerifyViewModel: ObservableObject {
         // AudioEngineController 持有的是旧 network 引用，必须一起换
         self.audio = AudioEngineController(network: net)
 
+        // ★★★ 重建后必须立刻把 UI 参数重新灌回去（2026-10-09 第二十二轮）★★★
+        //
+        // 新 AudioEngineController 里的 SignalChain 用的是 **struct 默认值**
+        // （aecEnabled = true、aecStrength = 0.75 ……），
+        // 而用户此刻在 UI 上做的所有调整只存在于 VerifyViewModel 的
+        // @Published 属性里，**还没有传给这个新实例**。
+        //
+        // 后果（用户实测：2026-10-09）：
+        //   用户在 UI 上关掉「回声消除 AEC」→ 电视依旧无声。
+        //   看起来像「AEC 不是原因」，其实是开关压根没作用到新实例上。
+        //
+        // 这和之前修过的「改了 IP 但连的还是旧的」是同一类坑：
+        // **重建了实例，却忘了把状态迁移过去。**
+        apply()
+
         net.onStateChange = { [weak self] state in
             DispatchQueue.main.async {
                 self?.applyNetworkState(state)
@@ -169,6 +184,9 @@ final class VerifyViewModel: ObservableObject {
 
     func disconnect() {
         audio.stop()
+        // ★ 先发 bye 再断 socket —— 让盒子立刻复位会话，
+        //   否则它会一直挂着「手机已连接」直到空闲超时（3 秒）。
+        network.sendBye()
         network.disconnect()
         isConnected = false
         isNetworkReady = false
