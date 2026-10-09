@@ -98,8 +98,12 @@ final class NetworkController {
         }
 
         state = .connecting
+        hasAck = false
 
         // ── 音频连接（单向上行）──
+        //
+        // ⚠️ UDP 的 `.ready` **不代表对端存在**，只代表本地 socket 绑定成功。
+        //    所以这里绝不能直接 `state = .ready`（那是之前的 bug）。
         let audio = NWConnection(host: NWEndpoint.Host(hostValue),
                                  port: audioPortNW, using: .udp)
         audioConnection = audio
@@ -107,9 +111,10 @@ final class NetworkController {
             guard let self else { return }
             switch s {
             case .ready:
-                self.state = .ready
+                // socket 就绪 → 发 hello 探活，但**状态仍保持 .connecting**
                 self.sendHello()
                 self.startPing()
+                self.startAckTimeout()
             case .failed(let err):
                 self.state = .failed("\(err.localizedDescription)")
             default:
@@ -160,6 +165,21 @@ final class NetworkController {
         controlConnection = nil
         pingSentAt.removeAll()
         state = .idle
+    }
+
+    // MARK: - 握手超时检测
+
+    /// 发了 hello 之后等一会儿，看盒子有没有回 hello_ack。
+    ///
+    /// ★ UDP 没有「连接失败」这种事件 ——
+    ///   发出去的包如果对端不存在，会被内核静默丢弃，
+    ///   既不报错也不超时。所以必须自己做超时判断，
+    ///   否则 UI 会一直显示「已连接」，用户以为连上了，其实一个包都没送到。
+    private func startAckTimeout() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + ackTimeout) { [weak self] in
+            guard let self, self.state == .connecting, !self.hasAck else { return }
+            self.state = .failed("盒子无响应（\(self.hostValue)）\n请检查：IP 是否正确 / 是否同一 WiFi / 盒子服务是否已启动")
+        }
     }
 
     // MARK: - 发送
@@ -244,6 +264,37 @@ final class NetworkController {
             let d = json["data"] as? [String: Any]
             deviceName = d?["deviceName"] as? String ?? "盒子"
             bufferFillMs = Float(d?["bufferMs"] as? Int ?? 0)
+
+            // ★★★ 关键修复（2026-10-09）：只有收到 hello_ack 才算真正连上
+            //
+            // 问题：UDP 的 NWConnection 在 `.ready` 时**只代表本地 socket 绑定成功**，
+            //       它根本不检查对端是否存在。
+            //       所以原来在 `.ready` 里直接 `state = .ready` 是错的 ——
+            //       在公司连 `192.168.1.5`（那台机器根本不存在）也会显示「已连接」。
+            //
+            // 证据：用户在公司测，公司里不可能有那台盒子，但手机显示已连接。
+            //
+            // 正确逻辑：连接分三态
+            //   .connecting → 已发出 hello，等回复
+            //   .ready      → 收到 hello_ack，盒子确认在线
+            //   .failed     → 超时未收到 → 明确报「盒子无响应」
+            //
+            // 注意：盒子端在收到**音频包**时才置 clientConnected，
+            //       而 hello_ack 在收到 hello 控制包时就发 ——
+            //       所以 hello_ack 是最早的「盒子在线」信号。
+            hasAck = true
+            if state == .connecting {
+                state = .ready
+            }
         }
     }
+
+    /// 是否已收到盒子的 hello_ack（= 盒子真的在线）
+    private var hasAck = false
+
+    /// 等待 hello_ack 的超时时间。
+    ///
+    /// UDP 无连接，不存在「连接失败」事件，
+    /// 只能靠「发了 hello 之后有没有人回」来判断对端在不在。
+    private let ackTimeout: TimeInterval = 2.0
 }
