@@ -28,4 +28,4 @@ xcuserdata/
 # push_via_api.py 的 blob 缓存（仅本机用，不该进仓库）
 .push_blob_cache.json
 
-# ★ 注意：Info.plist 和 Swift 源码必须入库，不要误加进忽略列表
+# ★ 注意：Info.plist 和 Swift 源码必须入库，不要误加进忽略列表ci_log/
