@@ -71,7 +71,6 @@ final class DeviceDiscovery: NSObject, ObservableObject {
     /// 接收用：绑定 50002，收盒子的广播
     private var listenSocket: NWConnection?
     /// 发送用：另一个 ephemeral 端口，用来发 discover_query
-    private var sendSocket: NWConnection?
 
     private var isListening = false
     private let discoveryPort: UInt16 = 50002
@@ -92,9 +91,9 @@ final class DeviceDiscovery: NSObject, ObservableObject {
     func stop() {
         isListening = false
         listenSocket?.cancel()
-        sendSocket?.cancel()
+        queryTimer?.cancel()
         listenSocket = nil
-        sendSocket = nil
+        queryTimer = nil
         devices = []
         print("[Discovery] 已停止")
     }
@@ -134,20 +133,12 @@ final class DeviceDiscovery: NSObject, ObservableObject {
 
     // MARK: - 发送查询
 
-    /// 用独立的 socket 发查询，**不能复用接收那个** ——
-    /// 复用会把自己的查询包也当成广播收回来。
+    /// 启动周期性查询（每 2 秒一次）。
+    ///
+    /// 不再持有常驻 sendSocket —— `sendQuery()` 每次自己建临时连接发完即cancel，
+    /// 这样不存在「把自己的查询当广播收回来」的问题。
     private func startSending() {
-        sendSocket = NWConnection(host: .ipv4(.any), port: .any, using: .udp)
-        sendSocket?.stateUpdateHandler = { [weak self] state in
-            if case .ready = state {
-                print("[Discovery] 发送端就绪")
-                // 每 2 秒发一次查询
-                self?.scheduleQuery()
-            } else if case .failed(let err) = state {
-                print("[Discovery] 发送端失败: \(err.localizedDescription)")
-            }
-        }
-        sendSocket?.start(queue: .global(qos: .utility))
+        scheduleQuery()
     }
 
     private var queryTimer: DispatchSourceTimer?
@@ -174,17 +165,28 @@ final class DeviceDiscovery: NSObject, ObservableObject {
             data: ["clientName": UIDevice.current.name]
         )
 
-        // 复用 sendSocket 往广播地址发。
-        // ★ 关键：sendSocket 绑在 .any:any（ephemeral 端口），
-        //   和接收用的 50002 不是同一个 socket，
-        //   所以不会把自己发出去的查询当成盒子广播收回来。
-        guard let sendSocket else { return }
-        sendSocket.send(
-            content: payload,
-            to: .ipv4(.broadcast),
-            port: 50002,
-            completion: .idempotent
+        // ── 向广播地址发查询 ──
+        // ★ NWConnection **没有** send(content:to:port:) 这个重载
+        //   （它只有 send(content:completion:)，只能发给创建时指定的端点）。
+        //   所以要发到广播地址，必须为广播端点新建一个连接。
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host("255.255.255.255"),
+            port: NWEndpoint.Port(rawValue: 50002)!
         )
+        let querySocket = NWConnection(to: endpoint, using: .udp)
+        querySocket.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                querySocket.send(content: payload, completion: .contentProcessed { _ in
+                    querySocket.cancel()
+                })
+            case .failed, .cancelled:
+                querySocket.cancel()
+            default:
+                break
+            }
+        }
+        querySocket.start(queue: .global(qos: .utility))
     }
 
     // MARK: - 解析
