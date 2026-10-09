@@ -36,6 +36,9 @@ final class AudioEngineController {
     private let frameSize: Int = KaraokeProtocol.safeFrameCount
     private let sampleRate: Double = 48000
 
+    /// 平滑发送专用队列（不阻塞 AVAudioEngine 的实时回调）
+    private let sendQueue = DispatchQueue(label: "com.xuebao.karamic.send", qos: .userInteractive)
+
     // MARK: - 状态
 
     private(set) var isRunning = false
@@ -249,13 +252,49 @@ final class AudioEngineController {
         let maxChunk = KaraokeProtocol.safeFrameCount      // 240
         guard !samples.isEmpty else { return }
 
-        var offset = 0
-        while offset < samples.count {
-            let end = min(offset + maxChunk, samples.count)
-            network.sendAudioFrame(samples: Array(samples[offset..<end]),
-                                   sampleRate: UInt16(sampleRate))
+        // ════════════════════════════════════════════════════════════════
+        //  ★ 平滑发送（第二十三轮）—— 降低欠载与延迟的关键
+        // ════════════════════════════════════════════════════════════════
+        //
+        //  【之前】一个 tap 回调（960 帧 = 20ms 的音频）被切成 4 个包后
+        //  **在几微秒内一口气全发出去**，然后干等 20ms 直到下一个回调。
+        //
+        //  盒子端看到的就是「瞬间到达 4 包 + 15ms 空窗」的**突发流**：
+        //   · 空窗期只能靠缓冲顶着，缓冲一浅就欠载
+        //     （实测每秒 50~80 次，用户能听出断续）
+        //   · 为了让缓冲顶得住，只能把缓冲调深 → 延迟被迫变大
+        //   这两件事其实是同一个根因。
+        //
+        //  【现在】把这 4 个包**均摊到这 20ms 内**发出：
+        //   960 帧 / 48000Hz = 20ms，分 4 片 ⇒ 每 5ms 发一片。
+        //  盒子端就变成了一条**匀速流**，缓冲只要很浅就够了 →
+        //  欠载大幅减少，延迟也能跟着压下来。
+        //
+        //  为什么放在后台队列：不能阻塞 AVAudioEngine 的 tap 回调，
+        //  否则会丢帧（实时音频线程的黄金规则：回调里不做等待）。
+        // ════════════════════════════════════════════════════════════════
+        let chunks = stride(from: 0, to: samples.count, by: maxChunk).map {
+            Array(samples[$0..<min($0 + maxChunk, samples.count)])
+        }
+        guard !chunks.isEmpty else { return }
+
+        // 这一帧覆盖的真实时长 ÷ 片数 = 每片之间该隔多久
+        let frameMs = Double(samples.count) / sampleRate * 1000.0
+        let gapUs = UInt32(max(0, frameMs / Double(chunks.count) * 1000.0))
+
+        if chunks.count == 1 {
+            network.sendAudioFrame(samples: chunks[0], sampleRate: UInt16(sampleRate))
             sentFrames += 1
-            offset = end
+        } else {
+            sendQueue.async { [weak self] in
+                guard let self else { return }
+                for (i, c) in chunks.enumerated() {
+                    if i > 0, gapUs > 0 { usleep(useconds_t(gapUs)) }
+                    self.network.sendAudioFrame(samples: c,
+                                                sampleRate: UInt16(self.sampleRate))
+                    self.sentFrames += 1
+                }
+            }
         }
 
         // ★ 第十三轮：统计**真正进包的 Int16 样本**的幅度。
