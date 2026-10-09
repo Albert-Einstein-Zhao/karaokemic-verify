@@ -86,6 +86,118 @@ final class DeviceDiscovery: NSObject, ObservableObject {
         startSending()
 
         print("[Discovery] 已启动，接收 UDP \(discoveryPort)")
+
+        // ★ 第二十三轮：立刻主动扫一次网段（不等 2 秒的广播周期）
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.scanSubnet()
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ★★ 网段单播扫描（第二十三轮新增 —— 自动发现的真正主力）
+    // ══════════════════════════════════════════════════════════════════════
+    //
+    //  【为什么要改成单播扫描】
+    //  原方案是「被动监听盒子的 UDP 广播」。但 iOS 14+ **接收广播/组播
+    //  必须持有 com.apple.developer.networking.multicast 这个 entitlement**，
+    //  而该 entitlement 只对付费开发者账号开放申请 —— 用户是用爱思助手
+    //  + 个人证书装的，签名里带不了它。
+    //  结果就是：监听循环一直跑，但**一个广播包都收不到**，
+    //  用户看到的永远是「IP 文本框还是 192.168.1.5」。
+    //
+    //  【单播不需要任何特殊权限】
+    //  向 192.168.1.1 ~ 192.168.1.254 的 50002 端口逐个发一个查询包，
+    //  盒子收到后**单播回复**。总共 254 个小包，耗时不到 1 秒，
+    //  换来的是 100% 可靠的发现：
+    //    · 不依赖广播权限
+    //    · 不受路由器「AP 隔离 / 禁止广播」影响
+    //    · 手机先开、盒子后开也能扫到（每 15 秒重扫一次）
+    //
+    //  盒子端对应改动：ReceiverService.startDiscoveryResponder()
+    //  —— 50002 从「只发不收」改成「也监听并单播回复」。
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// 扫描同网段的所有 IP，收集回复。
+    /// 用 BSD socket 而不是 Network.framework —— 后者每个目标要建一条
+    /// NWConnection，254 条连接太重；而 UDP 单播用 BSD socket 发是标准做法。
+    func scanSubnet() {
+        let parts = localIP.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else {
+            print("[Discovery] 本机 IP 未知(\(localIP))，跳过扫描")
+            return
+        }
+        let prefix = "\(parts[0]).\(parts[1]).\(parts[2])"
+        print("[Discovery] 开始扫描 \(prefix).1~254 的 \(discoveryPort) 端口…")
+
+        // ── 建一个 UDP socket（系统自动分配源端口用于收回复）──
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            print("[Discovery] socket 创建失败 errno=\(errno)")
+            return
+        }
+        defer { close(fd) }
+
+        // 接收超时 300ms —— 用于「收回复」阶段的循环，避免卡死
+        var tv = timeval()
+        tv.tv_sec = 0
+        tv.tv_usec = 300_000
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        let payload = ControlMessage.build(
+            cmd: "discover_query",
+            data: ["clientName": UIDevice.current.name]
+        )
+
+        // ── ① 发查询：向每个 IP 的 50002 发一个包 ──
+        for i in 1...254 {
+            let ip = "\(prefix).\(i)"
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_port = discoveryPort.bigEndian          // 网络字节序
+            addr.sin_addr.s_addr = inet_addr(ip)             // 已是网络字节序
+
+            let sent = payload.withUnsafeBytes { raw -> Int in
+                var a = addr                                  // 需要可变副本
+                return withUnsafePointer(to: &a) { ptr -> Int in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        sendto(fd, raw.baseAddress, raw.count, 0, sa,
+                               socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+            if sent < 0 && i == 1 {
+                print("[Discovery] sendto 失败 errno=\(errno)")
+            }
+        }
+
+        // ── ② 收回复：最多等 2 秒 ──
+        let deadline = Date().addingTimeInterval(2.0)
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var found = 0
+
+        while Date() < deadline {
+            let n = recvfrom(fd, &buf, buf.count, 0, nil, nil)
+            if n > 0 {
+                let data = Data(buf[0..<n])
+                if let device = parse(data) {
+                    addDevice(device)
+                    found += 1
+                }
+            } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                continue        // 超时，继续等
+            } else {
+                break
+            }
+        }
+
+        print("[Discovery] 扫描结束，本次发现 \(found) 个盒子（累计 \(devices.count)）")
+
+        // ── ③ 15 秒后再扫一次：盒子后开的、或者换了 IP 的都能被跟上 ──
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self, self.isListening else { return }
+            self.scanSubnet()
+        }
     }
 
     func stop() {

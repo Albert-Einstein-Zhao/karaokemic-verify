@@ -49,6 +49,24 @@ final class AudioEngineController {
     private(set) var frameCounter: Int = 0
     private(set) var sentFrames: Int = 0
 
+    /// ★ 新增（第二十三轮）：iOS 真机实际给的采集帧长（样本数）。
+    ///   `installTap(bufferSize:)` 只是**建议值**，真机常给 480/960，
+    ///   这一段的耗时是端到端延迟里被忽略的一块。
+    private(set) var captureFrameLength: Int = 0
+
+    /// 采集侧延迟（ms）= 硬件 I/O 缓冲 + 当前采集帧的时长
+    ///
+    /// AVAudioSession.ioBufferDuration 是系统实际给的硬件缓冲（我们请求 5ms），
+    /// captureFrameLength/sampleRate 是这一帧本身覆盖的时间。
+    /// 两者相加才是「声音从进麦克风到被我们拿到」的延迟。
+    var captureLatencyMs: Float {
+        let io = Float(AVAudioSession.sharedInstance().ioBufferDuration) * 1000
+        let frame = captureFrameLength > 0
+            ? Float(captureFrameLength) / Float(sampleRate) * 1000
+            : 0
+        return io + frame
+    }
+
     /// ★ 新增（第十三轮）：Int16 量化之后真正发送的幅度（dBFS）。
     ///
     /// 用它替代「估一个放大后的电平」，因为只有它能回答
@@ -165,6 +183,9 @@ final class AudioEngineController {
         }
 
         guard samples.count > 0 else { return }
+
+        // 记录真机实际回调的帧长（用于延迟显示，也让 UI 能看出 tap 是否异常）
+        captureFrameLength = samples.count
 
         // ── DSP ──
         let out = signalChain.process(input: samples)

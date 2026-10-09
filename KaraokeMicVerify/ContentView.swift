@@ -109,7 +109,10 @@ struct ContentView: View {
     private var ipSection: some View {
         VStack(spacing: 12) {
             HStack {
-                TextField("盒子 IP", text: $vm.boxIP)
+                // ★ placeholder 会随扫描状态变：没填时提示「自动扫描中…」，
+                //   用户一眼就知道该等还是该手填（第二十三轮）
+                TextField(vm.boxIP.isEmpty ? "自动扫描盒子…" : "盒子 IP",
+                          text: $vm.boxIP)
                     .textFieldStyle(.plain)
                     .font(.system(size: 17, design: .monospaced))
                     .keyboardType(.numbersAndPunctuation)
@@ -117,6 +120,10 @@ struct ContentView: View {
                     .padding(12)
                     .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                     .foregroundStyle(.white)
+                    .onChange(of: vm.boxIP) { _ in
+                        // 用户手动改过 → 之后不再被自动扫描结果覆盖
+                        vm.markIPManuallyEdited()
+                    }
 
                 Button {
                     if vm.isConnected {
@@ -206,10 +213,10 @@ struct ContentView: View {
             // ★ 延迟 —— 最关键的指标
             bigMetric(
                 title: "端到端延迟",
-                value: String(format: "%.0f", vm.network.estimatedLatencyMs),
+                value: String(format: "%.0f", vm.totalLatencyMs),
                 unit: "ms",
-                caption: "RTT/2 \(String(format: "%.1f", vm.network.roundTripMs)) + 盒子缓冲 \(String(format: "%.0f", vm.network.bufferFillMs)) + 输出 20",
-                tint: vm.network.estimatedLatencyMs < 120 ? .green : .orange
+                caption: "采集 \(String(format: "%.0f", vm.latencyBreakdown.capture)) + 网络 \(String(format: "%.1f", vm.latencyBreakdown.network)) + 盒缓冲 \(String(format: "%.0f", vm.latencyBreakdown.box)) + 输出 \(String(format: "%.0f", vm.latencyBreakdown.output))",
+                tint: vm.totalLatencyMs < 80 ? .green : (vm.totalLatencyMs < 130 ? .yellow : .orange)
             )
 
             HStack(spacing: 12) {

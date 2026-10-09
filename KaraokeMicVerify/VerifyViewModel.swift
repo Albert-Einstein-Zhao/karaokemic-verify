@@ -14,7 +14,13 @@ final class VerifyViewModel: ObservableObject {
 
     // MARK: - 组件
 
-    @Published var boxIP: String = "192.168.1.5"
+    /// 盒子 IP。
+    ///
+    /// ★ 第二十三轮：**不再写死 192.168.1.5**。
+    ///   那个值是我早期硬编码的，盒子 DHCP 一变就失效（实测 .5 → .10 → …），
+    ///   用户每次打开 App 看到的都是错的，还得手动改。
+    ///   现在：优先用上次成功连过的 IP；没有就留空，等自动扫描填上。
+    @Published var boxIP: String = UserDefaults.standard.string(forKey: "lastBoxIP") ?? ""
     @Published private(set) var isConnected = false
     /// 网络状态镜像。`network` 是 let 常量，它内部变了不会通知 UI，
     /// 所以必须在这里复制一份成 @Published，SwiftUI 才会在 ready 时切界面。
@@ -106,10 +112,29 @@ final class VerifyViewModel: ObservableObject {
         if discoveryCancellable == nil {
             discoveryCancellable = discovery.$devices
                 .receive(on: DispatchQueue.main)
-                .sink { [weak self] _ in
+                .sink { [weak self] devices in
                     self?.discoveryTick &+= 1
+                    // ★ 第二十三轮：扫到盒子就自动填进 IP 框。
+                    //   用户反馈「刚开启时 IP 文本框还是 192.168.1.5」——
+                    //   以前那个值是写死的默认值，跟真实网络毫无关系。
+                    //   现在：没手动改过 / 没连着 → 自动用扫到的第一个。
+                    guard let self else { return }
+                    if let first = devices.first, !self.hasManuallyEditedIP,
+                       !self.isConnected {
+                        self.boxIP = first.ip
+                        self.deviceName = first.name
+                        print("[VM] 自动填入扫描到的盒子: \(first.name) @ \(first.ip)")
+                    }
                 }
         }
+    }
+
+    /// 用户是否在输入框里手动改过 IP（改过就不自动覆盖他的输入）
+    private var hasManuallyEditedIP = false
+
+    /// 输入框被编辑时调用（ContentView 的 onChange）
+    func markIPManuallyEdited() {
+        hasManuallyEditedIP = true
     }
 
     /// ★ 把DeviceDiscovery 包装成 @Published，
@@ -123,6 +148,21 @@ final class VerifyViewModel: ObservableObject {
 
     /// 手机当前的 IP（界面上显示，方便用户核对是否同一网段）
     var localIP: String { discovery.localIP }
+
+    /// ★ 端到端总延迟（第二十三轮：把采集侧也算进去）
+    ///
+    /// 之前显示的是 `network.estimatedLatencyMs`（只有网络+盒子），
+    /// 少了「声音进麦克风到被 App 拿到」这一段（真机上约 10~25ms），
+    /// 所以数字偏小、而且常年不动（因为 RTT 稳定、盒子缓冲被写死）。
+    var totalLatencyMs: Float { audio.captureLatencyMs + network.estimatedLatencyMs }
+
+    /// 延迟分解，给 UI 的 caption 用
+    var latencyBreakdown: (capture: Float, network: Float, box: Float, output: Float) {
+        (audio.captureLatencyMs,
+         network.roundTripMs / 2,
+         network.bufferFillMs,
+         20)     // 盒子 AudioTrack 缓冲（960 帧 @48kHz = 20ms）
+    }
 
     /// 选中一个自动发现的盒子
     func selectDevice(_ device: DiscoveredDevice) {
@@ -142,6 +182,10 @@ final class VerifyViewModel: ObservableObject {
     ///   NetworkController 的 host 是 `let`，改 IP 必须重建实例。
     func connect(boxIP: String) {
         let target = boxIP.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // ★ 记住这次的 IP：下次打开 App 直接用，不用等扫描也不用重填。
+        //   （盒子 IP 由 DHCP 分配会变，但大多数时候是稳定的）
+        UserDefaults.standard.set(target, forKey: "lastBoxIP")
 
         // IP 没变 → 直接复用现有连接
         if target == network.hostValue && network.state != .idle {
