@@ -90,6 +90,46 @@ final class VerifyViewModel: ObservableObject {
         }
     }
 
+    // MARK: - 自动发现盒子
+
+    /// 启动时开始自动扫描局域网里的盒子。
+    ///
+    /// ★ 为什么需要（第 17 轮的教训）：
+    ///   盒子 IP 由 DHCP 分配会变（实测 .5 → .10），
+    ///   手动改 IP 既容易忘又容易打错。
+    ///   盒子端本来就在每秒广播自己的 IP（discover_reply），
+    ///   我们直接监听就好 —— 用户一次配置都不用改。
+    func startDiscovery() {
+        discovery.start()
+        // 订阅扫描结果：每次设备列表变化就 bump 一下 tick，
+        // 触发 SwiftUI 重新求值 discoveredDevices
+        if discoveryCancellable == nil {
+            discoveryCancellable = discovery.$devices
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.discoveryTick &+= 1
+                }
+        }
+    }
+
+    /// ★ 把DeviceDiscovery 包装成 @Published，
+    ///   这样 SwiftUI 才会因为「扫描到新设备」而刷新界面。
+    private let discovery = DeviceDiscovery.shared
+    @Published private var discoveryTick: Int = 0
+    private var discoveryCancellable: AnyCancellable?
+
+    /// 扫描到的设备列表
+    var discoveredDevices: [DiscoveredDevice] { discovery.devices }
+
+    /// 手机当前的 IP（界面上显示，方便用户核对是否同一网段）
+    var localIP: String { discovery.localIP }
+
+    /// 选中一个自动发现的盒子
+    func selectDevice(_ device: DiscoveredDevice) {
+        boxIP = device.ip
+        deviceName = device.name
+    }
+
     // MARK: - 连接
 
     /// 连接到指定 IP 的盒子。

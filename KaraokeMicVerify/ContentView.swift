@@ -18,7 +18,13 @@
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var vm = VerifyViewModel()
+    // ★ 从 App 层注入（第 18 轮改成 @EnvironmentObject）
+    //
+    //   原来这里自己 @StateObject 创建 VerifyViewModel，
+    //   App 层的 onAppear 里就拿不到同一个实例，自动发现无法启动。
+    //   改成由 App 创建并通过 environmentObject 传下来，
+    //   保证「扫描发现的设备」和「界面显示的状态」是同一份数据。
+    @EnvironmentObject private var vm: VerifyViewModel
 
     var body: some View {
         ZStack {
@@ -129,6 +135,43 @@ struct ContentView: View {
             }
 
             statusRow
+
+            // ★ 自动发现的盒子（第 18 轮新增）
+            //
+            // 盒子端本来就在每秒广播自己的 IP，我们直接监听。
+            // 这样盒子 IP 变了（DHCP 经常变）也不用手动改 —— 一次配置都不用动。
+            if !vm.discoveredDevices.isEmpty {
+                VStack(spacing: 6) {
+                    ForEach(vm.discoveredDevices) { device in
+                        Button {
+                            vm.selectDevice(device)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "dot.radiowaves.left.and.right")
+                                    .font(.system(size: 13))
+                                Text("\(device.name) · \(device.ip)")
+                                    .font(.system(size: 13, design: .monospaced))
+                                Spacer()
+                                if vm.boxIP == device.ip {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 12, weight: .bold))
+                                        .foregroundStyle(.green)
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .background(
+                                vm.boxIP == device.ip
+                                    ? Color.green.opacity(0.18)
+                                    : Color.white.opacity(0.06),
+                                in: RoundedRectangle(cornerRadius: 8)
+                            )
+                            .foregroundStyle(.white)
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
         }
     }
 
