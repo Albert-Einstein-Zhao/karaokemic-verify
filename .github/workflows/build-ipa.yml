@@ -25,6 +25,7 @@ on:
     branches: [main]
     paths:
       - 'KaraokeMicVerify/**'
+      - 'KaraokeMic/**'
       - 'project.yml'
       - '.github/workflows/build-ipa.yml'
 
@@ -84,16 +85,20 @@ jobs:
       # CODE_SIGNING_ALLOWED=NO 是关键：runner 上没有开发证书，
       # 任何签名步骤都会失败，直接关掉。产出的 .app 是「未签名」的，
       # 交给 Sideloadly 签名。
+      #
+      # ★ 第二十四轮：改编正式版 KaraokeMic scheme ——
+      #   验证版已完成使命（定位量化/延迟问题），修完同步回正式版后，
+      #   CI 直接出正式版 IPA。
       - name: 编译 archive
         run: |
           set -o pipefail
           xcodebuild \
             -project KaraokeMicVerify.xcodeproj \
-            -scheme KaraokeMicVerify \
+            -scheme KaraokeMic \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -archivePath ./build/KaraokeMicVerify.xcarchive \
+            -archivePath ./build/KaraokeMic.xcarchive \
             -derivedDataPath ./build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -109,11 +114,11 @@ jobs:
 
       # ── 5. 打包成 IPA ────────────────────────────────────────────
       # xcodebuild 在没有签名凭证时无法 export 出 ipa，
-      # 所以手工拼标准 IPA 结构：Payload/KaraokeMicVerify.app
+      # 所以手工拼标准 IPA 结构：Payload/KaraokeMic.app
       - name: 打包 unsigned IPA
         run: |
           set -e
-          APP="./build/KaraokeMicVerify.xcarchive/Products/Applications/KaraokeMicVerify.app"
+          APP="./build/KaraokeMic.xcarchive/Products/Applications/KaraokeMic.app"
           if [ ! -d "$APP" ]; then
             echo "❌ 没找到 .app，编译可能失败了。日志末尾："
             tail -50 build.log
@@ -122,7 +127,7 @@ jobs:
 
           echo "▸ .app 体积：$(du -sh "$APP" | cut -f1)"
           echo "▸ Mach-O 架构："
-          lipo -info "$APP/KaraokeMicVerify"
+          lipo -info "$APP/KaraokeMic"
 
           # IPA 标准结构：一个名为 Payload 的目录，里面放 .app
           rm -rf ./build/Payload
@@ -130,13 +135,13 @@ jobs:
           cp -R "$APP" ./build/Payload/
 
           cd ./build
-          zip -qry KaraokeMicVerify-unsigned.ipa Payload
+          zip -qry KaraokeMic-unsigned.ipa Payload
           cd ..
 
           echo "▸ 产物信息："
-          ls -lh ./build/KaraokeMicVerify-unsigned.ipa
+          ls -lh ./build/KaraokeMic-unsigned.ipa
           echo "▸ IPA 内部结构校验："
-          unzip -l ./build/KaraokeMicVerify-unsigned.ipa | head -8
+          unzip -l ./build/KaraokeMic-unsigned.ipa | head -8
 
       # ── 6. 顺带验证 Info.plist 关键权限有没有带上 ────────────────
       # 这三项任何一个漏了，App 装上也是废的：
@@ -146,7 +151,7 @@ jobs:
       - name: 校验权限声明
         run: |
           set -e
-          PLIST="./build/KaraokeMicVerify.xcarchive/Products/Applications/KaraokeMicVerify.app/Info.plist"
+          PLIST="./build/KaraokeMic.xcarchive/Products/Applications/KaraokeMic.app/Info.plist"
 
           check() {
             if plutil -extract "$1" raw -o - "$PLIST" >/dev/null 2>&1; then
@@ -177,8 +182,8 @@ jobs:
       - name: 上传 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: KaraokeMicVerify-unsigned
-          path: build/KaraokeMicVerify-unsigned.ipa
+          name: KaraokeMic-unsigned
+          path: build/KaraokeMic-unsigned.ipa
           # Actions 产物最多存 90 天，默认 14 天就够用了
           retention-days: 30
           if-no-files-found: error

@@ -37,7 +37,43 @@ final class AudioEngineController {
     private let sampleRate: Double = 48000
 
     /// 平滑发送专用队列（不阻塞 AVAudioEngine 的实时回调）
+    ///
+    /// ⚠️ 这是**串行**队列：一次 tap 回调派发一个任务，任务内部把这一帧
+    ///    切成的小片按时间均摊发出。串行意味着任务只能一个接一个执行 ——
+    ///    所以「任务耗时」必须小于「任务到达间隔」，否则队列会永久积压。
+    ///    （这正是第二十四轮延迟涨到几十秒的根因，见 sendChunked 的注释。）
     private let sendQueue = DispatchQueue(label: "com.xuebao.karamic.send", qos: .userInteractive)
+
+    // ── 发送积压统计（第二十四轮新增）──────────────────────────────────
+    /// 已派发但还没真正发出去的音频片数（每片 = frameSize 个样本）。
+    ///
+    /// 这是「发送侧积压」的直接度量，也是**真实端到端延迟里最大的一块**。
+    /// 队列健康时它应该在 0~4 之间波动；一旦持续上涨就说明发得比采得慢，
+    /// 延迟会线性累积且**永远不会自己追回来**。
+    private let backlogLock = NSLock()
+    private var pendingChunks = 0
+    private var droppedChunks = 0
+
+    /// 积压上限：超过就直接丢弃新帧，宁可丢一小段声音也不让延迟无限涨。
+    /// 12 片 × 240 帧 = 2880 样本 = 60ms 音频。
+    /// K歌 场景丢 60ms 只是极短一个「嗒」，但延迟失控是整首歌都唱不下去。
+    private let maxBacklogChunks = 12
+
+    /// 当前发送积压（毫秒）—— UI 显示用，是真实延迟的主要组成部分
+    var sendBacklogMs: Float {
+        backlogLock.lock()
+        let n = pendingChunks
+        backlogLock.unlock()
+        return Float(n) * Float(frameSize) / Float(sampleRate) * 1000.0
+    }
+
+    /// 因积压超限被丢弃的片数（诊断用：非零说明发送侧确实追不上）
+    var droppedChunkCount: Int {
+        backlogLock.lock()
+        let n = droppedChunks
+        backlogLock.unlock()
+        return n
+    }
 
     // MARK: - 状态
 
@@ -154,6 +190,14 @@ final class AudioEngineController {
         }
         engine.stop()
         signalChain.reset()
+
+        // ★ 必须清零发送积压计数：
+        //   若队列里还有派发完但没发出的任务，它们的 pendingChunks 永远
+        //   不会被减回来 → 重启后积压计数仍显示很高，甚至一直触发熔断。
+        backlogLock.lock()
+        pendingChunks = 0
+        droppedChunks = 0
+        backlogLock.unlock()
 
         isRunning = false
         currentLevelDb = -120
@@ -278,22 +322,99 @@ final class AudioEngineController {
         }
         guard !chunks.isEmpty else { return }
 
-        // 这一帧覆盖的真实时长 ÷ 片数 = 每片之间该隔多久
+        // ════════════════════════════════════════════════════════════════
+        //  ★★ 第二十四轮：延迟涨到几十秒的真根因就在这里 ★★
+        // ════════════════════════════════════════════════════════════════
+        //
+        //  【上一版（相对 usleep）】
+        //      for (i, c) in chunks.enumerated() {
+        //          if i > 0 { usleep(gapUs) }        // ← 相对等待
+        //          send(c)
+        //      }
+        //
+        //  在**串行队列**里用相对等待，会形成一个正反馈死锁：
+        //
+        //    sendQueue 是串行的 → 一帧的任务必须等上一帧跑完才开始。
+        //    tap 每 20ms 产出一帧（960 帧），任务要在 20ms 内跑完 4 片才不积压。
+        //    但 usleep(5000) 的真实耗时是「5ms + 调度开销」，
+        //    iOS 上这个开销常常就有 1~10ms（定时器合并、QoS 竞争、
+        //    发热降频时更差）。于是单轮很容易变成 25~35ms。
+        //
+        //    一旦单轮 > 20ms：
+        //      第 1 帧晚 5ms → 第 2 帧晚 10ms → 第 3 帧晚 15ms …
+        //      每一帧都在上一帧的欠账上**再加**新的欠账。
+        //    这个欠账没有任何机制能偿还 —— usleep 只会让下一轮更晚。
+        //
+        //    实测现象完全吻合用户描述：
+        //      刚开始 < 1s → 过一会 2s 多 → 再过一会几十秒。
+        //    就是一条单调递增、永不收敛的直线。
+        //
+        //  【这一版（绝对时间调度 + 积压熔断）】两道防线：
+        //
+        //   ① 绝对时间：第 i 片的目标时刻 = 本帧起始时刻 + i × gap。
+        //      每片发送前先算「距离目标还有多久」，只等**这个差值**。
+        //      上一轮迟了 5ms → 这一轮的 now 已经越过 due → 等待量自动变 0
+        //      → 立刻发送把欠账补回来。**误差不再累积**。
+        //
+        //   ② 熔断：pendingChunks 超过 12 片（60ms 音频）就整帧丢弃。
+        //      即使 ① 因为某种原因失效（比如 UDP send 长时间阻塞），
+        //      延迟也最多卡在 60ms，绝不可能涨到几十秒。
+        //      K歌 丢 60ms 只是极短一个「嗒」，比整首歌对不上嘴好得多。
+        //
+        //   为什么不用 DispatchSourceTimer：它需要额外的 RunLoop 与精度权衡，
+        //   而这里只要「对齐到绝对时刻 + 主动追赶」，usleep 足够。
+        //
+        //   ⚠️ usleep 实际精度约 200µs~1ms，所以等待量 < 500µs 时直接发，
+        //      否则「为了睡 0.2ms 反而付出 1ms 的调度代价」，越睡越慢。
+        // ════════════════════════════════════════════════════════════════
+
+        // 这一帧覆盖的真实时长 ÷ 片数 = 每片之间该隔多久（纳秒）
         let frameMs = Double(samples.count) / sampleRate * 1000.0
-        let gapUs = UInt32(max(0, frameMs / Double(chunks.count) * 1000.0))
+        let gapNs = UInt64(max(0.0, frameMs / Double(chunks.count) * 1_000_000.0))
 
         if chunks.count == 1 {
+            // 单包无需节流，直接发（最低延迟）
             network.sendAudioFrame(samples: chunks[0], sampleRate: UInt16(sampleRate))
             sentFrames += 1
-        } else {
-            sendQueue.async { [weak self] in
-                guard let self else { return }
-                for (i, c) in chunks.enumerated() {
-                    if i > 0, gapUs > 0 { usleep(useconds_t(gapUs)) }
-                    self.network.sendAudioFrame(samples: c,
-                                                sampleRate: UInt16(self.sampleRate))
-                    self.sentFrames += 1
+            return
+        }
+
+        // ── 防线 ②：积压熔断 ──
+        backlogLock.lock()
+        if pendingChunks > maxBacklogChunks {
+            droppedChunks += chunks.count
+            backlogLock.unlock()
+            return
+        }
+        pendingChunks += chunks.count
+        backlogLock.unlock()
+
+        // ── 防线 ①：绝对时间调度 ──
+        // 取「本帧起始时刻」作为时间原点。注意必须在派发**之前**取，
+        // 这样即使任务在队列里等了一会儿，也能靠绝对时刻把节奏拉回来。
+        let startNs = DispatchTime.now().uptimeNanoseconds
+
+        sendQueue.async { [weak self] in
+            guard let self else { return }
+            for (i, c) in chunks.enumerated() {
+                if i > 0, gapNs > 0 {
+                    let due = startNs + UInt64(i) * gapNs
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if due > now {
+                        let waitNs = due - now
+                        // < 500µs 就直接发（usleep 的开销比它本身还大）
+                        if waitNs >= 500_000 {
+                            usleep(useconds_t(min(waitNs / 1_000, 200_000)))
+                        }
+                    }
+                    // due <= now：已经迟了，不等待，立刻发 → 自动追赶
                 }
+                self.network.sendAudioFrame(samples: c,
+                                            sampleRate: UInt16(self.sampleRate))
+                self.sentFrames += 1
+                self.backlogLock.lock()
+                self.pendingChunks -= 1
+                self.backlogLock.unlock()
             }
         }
 

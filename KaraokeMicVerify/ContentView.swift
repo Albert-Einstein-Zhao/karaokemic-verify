@@ -215,7 +215,7 @@ struct ContentView: View {
                 title: "端到端延迟",
                 value: String(format: "%.0f", vm.totalLatencyMs),
                 unit: "ms",
-                caption: "采集 \(String(format: "%.0f", vm.latencyBreakdown.capture)) + 网络 \(String(format: "%.1f", vm.latencyBreakdown.network)) + 盒缓冲 \(String(format: "%.0f", vm.latencyBreakdown.box)) + 输出 \(String(format: "%.0f", vm.latencyBreakdown.output))",
+                caption: "采集 \(String(format: "%.0f", vm.latencyBreakdown.capture)) + 发送积压 \(String(format: "%.0f", vm.sendBacklogMs)) + 网络 \(String(format: "%.1f", vm.latencyBreakdown.network)) + 盒缓冲 \(String(format: "%.0f", vm.latencyBreakdown.box)) + 输出 \(String(format: "%.0f", vm.latencyBreakdown.output))",
                 tint: vm.totalLatencyMs < 80 ? .green : (vm.totalLatencyMs < 130 ? .yellow : .orange)
             )
 

@@ -154,7 +154,16 @@ final class VerifyViewModel: ObservableObject {
     /// 之前显示的是 `network.estimatedLatencyMs`（只有网络+盒子），
     /// 少了「声音进麦克风到被 App 拿到」这一段（真机上约 10~25ms），
     /// 所以数字偏小、而且常年不动（因为 RTT 稳定、盒子缓冲被写死）。
-    var totalLatencyMs: Float { audio.captureLatencyMs + network.estimatedLatencyMs }
+    /// ★ 端到端总延迟（第二十四轮：补上「发送积压」这块真正的大头）
+    ///
+    /// 用户实测「延迟几秒 → 几十秒」，而这里常年显示 145ms 不动 ——
+    /// 因为这个数字里从来没有包含**发送侧积压**：
+    /// 声音进麦克风后，要在串行发送队列里排队才能真正发出去，
+    /// 队列一旦追不上采集，这段等待会**无限增长**（见 AudioEngine 的注释）。
+    /// 它才是「几十秒」的主体，必须显示出来，否则指标会持续骗人。
+    var totalLatencyMs: Float {
+        audio.captureLatencyMs + audio.sendBacklogMs + network.estimatedLatencyMs
+    }
 
     /// 延迟分解，给 UI 的 caption 用
     var latencyBreakdown: (capture: Float, network: Float, box: Float, output: Float) {
@@ -163,6 +172,14 @@ final class VerifyViewModel: ObservableObject {
          network.bufferFillMs,
          20)     // 盒子 AudioTrack 缓冲（960 帧 @48kHz = 20ms）
     }
+
+    /// ★ 发送积压（ms）—— 单独暴露，因为它是最该盯的指标
+    ///
+    /// 健康时 0~20ms；持续上涨 = 发送追不上采集 = 延迟正在累积。
+    var sendBacklogMs: Float { audio.sendBacklogMs }
+
+    /// 因积压超限被丢弃的音频片数（非零 = 发送侧确实追不上，需要看日志）
+    var droppedChunkCount: Int { audio.droppedChunkCount }
 
     /// 选中一个自动发现的盒子
     func selectDevice(_ device: DiscoveredDevice) {
