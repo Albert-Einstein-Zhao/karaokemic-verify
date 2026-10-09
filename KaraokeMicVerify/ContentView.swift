@@ -90,6 +90,16 @@ struct ContentView: View {
         .padding(.top, 10)
     }
 
+    /// 输入框里的 IP 是否是合法的四段数字（1~254）
+    private var boxIPIsValid: Bool {
+        let parts = vm.boxIP.split(separator: ".")
+        guard parts.count == 4 else { return false }
+        for p in parts {
+            guard let v = Int(p), v >= 0, v <= 255 else { return false }
+        }
+        return true
+    }
+
     private var ipSection: some View {
         VStack(spacing: 12) {
             HStack {
@@ -309,9 +319,13 @@ struct ContentView: View {
             Text("请在下面输入盒子 IP，点「连接」")
                 .font(.system(size: 13))
                 .foregroundStyle(.gray)
-            Text("盒子 IP：192.168.1.5")
+            // ★ 2026-10-09 修复：原来这里写死了 "盒子 IP：192.168.1.5"，
+            //   用户改了输入框但这行提示不变，造成误导
+            //   （用户反馈「文本框改成.10 但提示还是 .5」）。
+            //   现在显示 vm.boxIP 的当前值，与输入框保持一致。
+            Text("盒子 IP：\(vm.boxIP)")
                 .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.cyan.opacity(0.8))
+                .foregroundStyle(.boxIPIsValid ? .cyan.opacity(0.8) : .orange)
         }
         .padding(.top, 30)
     }

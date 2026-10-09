@@ -23,8 +23,10 @@ final class VerifyViewModel: ObservableObject {
     /// 盒子名称（hello_ack 里带回来的），同样要镜像才能触发 UI 刷新
     @Published private(set) var deviceName: String = ""
 
-    let network: NetworkController
-    let audio: AudioEngineController
+    // ★ 从 let 改成 var：换盒子 IP 时需要重建实例。
+    //   原来它们是 let，导致 connect(boxIP:) 里的 IP 参数无效。
+    var network: NetworkController
+    var audio: AudioEngineController
 
     // MARK: - 监测数据（从 audio 镜像到 UI）
 
@@ -90,11 +92,39 @@ final class VerifyViewModel: ObservableObject {
 
     // MARK: - 连接
 
+    /// 连接到指定 IP 的盒子。
+    ///
+    /// ★ 修复（2026-10-09）：原来 `boxIP` 参数**完全没被使用** ——
+    ///   函数体里直接调`network.connect()`，用的是 init 时写死的
+    ///   `192.168.1.5`。所以用户在输入框里改 IP 是**完全无效的**：
+    ///   报错信息里显示的还是旧 IP（用户实测发现）。
+    ///
+    ///   NetworkController 的 host 是 `let`，改 IP 必须重建实例。
     func connect(boxIP: String) {
-        // NetworkController 的 host 是 let，改IP 需要重建实例。
-        // 验证版接受这个限制：换 IP 时先断开再连。
-        // （正式版会把 host 改成 var，或在这里重建 network 实例）
-        network.connect()
+        let target = boxIP.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // IP 没变 → 直接复用现有连接
+        if target == network.hostValue && network.state != .idle {
+            network.connect()
+            return
+        }
+
+        // IP 变了 → 先彻底停掉旧连接，再重建 network + audio
+        audio.stop()
+        network.disconnect()
+
+        let net = NetworkController(host: target)
+        self.network = net
+        // AudioEngineController 持有的是旧 network 引用，必须一起换
+        self.audio = AudioEngineController(network: net)
+
+        net.onStateChange = { [weak self] state in
+            DispatchQueue.main.async {
+                self?.applyNetworkState(state)
+            }
+        }
+
+        net.connect()
     }
 
     func disconnect() {
