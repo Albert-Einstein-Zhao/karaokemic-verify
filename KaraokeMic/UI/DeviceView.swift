@@ -55,8 +55,8 @@ struct DeviceView: View {
                       : "tv.badge.wifi")
                     .font(.system(size: 46, weight: .light))
                     .foregroundStyle(KaraokeTheme.accentCyan)
-                    .symbolEffect(.variableColor.iterative,
-                                  isActive: app.network.state == .discovering)
+                    .symbolEffectIfAvailable(
+                        active: app.network.state == .discovering)
             }
 
             VStack(spacing: 6) {

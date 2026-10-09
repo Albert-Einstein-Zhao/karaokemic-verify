@@ -75,7 +75,9 @@ targets:
   KaraokeMic:
     type: application
     platform: iOS
-    deploymentTarget: "15.0"
+    # ★ 16.0（CI 首次编译抓出）：正式版 UI 用了 NavigationStack /
+    #   toolbarBackground 等 iOS 16 API。验证版仍保持 15.0 不受影响。
+    deploymentTarget: "16.0"
 
     settings:
       base:

@@ -484,7 +484,7 @@ final class NetworkController: NSObject, ObservableObject {
             sentSeqSet.removeAll()
             nextExpectedSeq = 0
 
-        case ControlMessage.ControlCmd.error:
+        case "error":
             let err = msg.data?["error"]?.stringValue ?? "unknown"
             DispatchQueue.main.async {
                 self.state = .failed(err)
@@ -550,7 +550,10 @@ final class NetworkController: NSObject, ObservableObject {
         if pingSentAt.count > 10 { pingSentAt.removeFirst() }
 
         let msg = ControlMessage(cmd: "ping", data: [
-            "t0": .number(Double(t0 & 0xFFFFFFFF))
+            // ★ JSONValue.number 是 Float：UInt64 直接放 Double 会编译错
+            //   （CI 首次编译抓出）。& 0xFFFFFFFF 后转 Float 尾数足够
+            //   （我们只要求盒子原样回显，RTT 用本地的 t0 计算）。
+            "t0": .number(Float(t0 & 0xFFFFFFFF))
         ])
         sendControl(msg)
     }

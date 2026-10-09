@@ -165,40 +165,54 @@ struct HomeView: View {
 
             HStack(spacing: 10) {
                 ForEach(PerformMode.allCases) { mode in
-                    Button {
-                        app.applyPerformMode(mode)
-                    } label: {
-                        VStack(spacing: 5) {
-                            Image(systemName: mode.icon)
-                                .font(.system(size: 18))
-                            Text(mode.displayName)
-                                .font(.system(size: 11, weight: .medium))
-                            Text(mode.subtitle)
-                                .font(.system(size: 9))
-                                .foregroundStyle(.white.opacity(0.45))
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background {
-                            RoundedRectangle(cornerRadius: 14)
-                                .fill(app.activeMode == mode
-                                      ? KaraokeTheme.accentGradient.opacity(0.35)
-                                      : Color.white.opacity(0.05))
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 14)
-                                        .strokeBorder(
-                                            app.activeMode == mode
-                                                ? KaraokeTheme.accentCyan.opacity(0.6)
-                                                : Color.white.opacity(0.1),
-                                            lineWidth: 0.5)
-                                }
-                        }
-                        .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.plain)
+                    performModeButton(mode)
                 }
             }
         }
+    }
+
+    /// 单个演唱模式按钮。
+    /// ★ 单独抽成方法：原来内联在 ForEach 里，整个 quickPresets 嵌套太深，
+    ///   Swift 编译器类型检查超时（CI 首次编译报
+    ///   "unable to type-check this expression in reasonable time"）。
+    private func performModeButton(_ mode: PerformMode) -> some View {
+        let active = app.activeMode == mode
+        return Button {
+            app.applyPerformMode(mode)
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: mode.icon)
+                    .font(.system(size: 18))
+                Text(mode.displayName)
+                    .font(.system(size: 11, weight: .medium))
+                Text(mode.subtitle)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background {
+                // ★ 不用 ShapeStyle.opacity —— 那是 iOS 17+ API。
+                //   用 View 层 .opacity 控制选中态的深浅，任何版本都可用；
+                //   描边 overlay 必须放在 .opacity 之后，否则会一起被淡化。
+                let fill: AnyShapeStyle = active
+                    ? AnyShapeStyle(KaraokeTheme.accentGradient)
+                    : AnyShapeStyle(Color.white.opacity(0.05))
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(fill)
+                    .opacity(active ? 0.35 : 1.0)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 14)
+                            .strokeBorder(
+                                active
+                                    ? KaraokeTheme.accentCyan.opacity(0.6)
+                                    : Color.white.opacity(0.1),
+                                lineWidth: 0.5)
+                    }
+            }
+            .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 警告横幅

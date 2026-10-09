@@ -110,6 +110,41 @@ struct StudioView: View {
 
     // MARK: - 混响（你要求的功能）
 
+    /// 单个混响预设胶囊。
+    /// ★ 单独抽成方法：原来内联在 ForEach 里，Swift 编译器类型检查超时
+    ///   （CI 首次编译报 "unable to type-check in reasonable time"）。
+    ///   顺带把 fill 的三元改用 AnyShapeStyle 包 —— LinearGradient 与 Color
+    ///   是不同类型，裸三元本身也是拖慢类型检查的元凶。
+    private func reverbPresetChip(_ preset: ReverbPreset) -> some View {
+        let selected = app.params.reverbPreset == preset
+        return Button {
+            app.params.reverbPreset = preset
+            let p = preset.parameters
+            app.params.reverbWet = p.wet
+            app.params.reverbDamping = p.damping
+            app.params.reverbRoomSize = p.roomSize
+            app.params.reverbWidth = p.width
+        } label: {
+            VStack(spacing: 3) {
+                Text(preset.displayName)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(preset.subtitle)
+                    .font(.system(size: 9))
+                    .opacity(0.6)
+            }
+            .frame(minWidth: 66)
+            .padding(.vertical, 9)
+            .background {
+                let style: AnyShapeStyle = selected
+                    ? AnyShapeStyle(KaraokeTheme.accentGradient)
+                    : AnyShapeStyle(Color.white.opacity(0.07))
+                Capsule().fill(style)
+            }
+            .foregroundStyle(selected ? Color.white : Color.white.opacity(0.7))
+        }
+        .buttonStyle(.plain)
+    }
+
     private var reverbSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             sectionHeader("混响效果",
@@ -120,36 +155,7 @@ struct StudioView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(ReverbPreset.allCases) { preset in
-                        Button {
-                            app.params.reverbPreset = preset
-                            let p = preset.parameters
-                            app.params.reverbWet = p.wet
-                            app.params.reverbDamping = p.damping
-                            app.params.reverbRoomSize = p.roomSize
-                            app.params.reverbWidth = p.width
-                        } label: {
-                            VStack(spacing: 3) {
-                                Text(preset.displayName)
-                                    .font(.system(size: 13, weight: .semibold))
-                                Text(preset.subtitle)
-                                    .font(.system(size: 9))
-                                    .opacity(0.6)
-                            }
-                            .frame(minWidth: 66)
-                            .padding(.vertical, 9)
-                            .background {
-                                Capsule().fill(
-                                    app.params.reverbPreset == preset
-                                    ? KaraokeTheme.accentGradient
-                                    : Color.white.opacity(0.07)
-                                )
-                            }
-                            .foregroundStyle(
-                                app.params.reverbPreset == preset
-                                ? Color.white : Color.white.opacity(0.7)
-                            )
-                        }
-                        .buttonStyle(.plain)
+                        reverbPresetChip(preset)
                     }
                 }
                 .padding(.horizontal, 1)

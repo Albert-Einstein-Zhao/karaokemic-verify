@@ -276,9 +276,11 @@ enum AudioFrameBuilder {
         )
 
         // Int16 → 小端字节流
+        // ⚠️ Data.append(UnsafeRawBufferPointer) 需要 contentsOf: 标签
+        //    （CI 第一次编译报 missing argument label 'contentsOf:'）
         int16Buffer.withUnsafeBufferPointer { src in
-            data.append(UnsafeRawBufferPointer(start: src.baseAddress!,
-                                               count: frameCount * 2))
+            data.append(contentsOf: UnsafeRawBufferPointer(
+                start: src.baseAddress!, count: frameCount * 2))
         }
 
         return data
@@ -292,7 +294,6 @@ enum AudioFrameBuilder {
         guard payload.count >= count * 2 else { return [] }
 
         var samples = [Float](repeating: 0, count: count)
-        let scale = 1.0 / Float(Int16.max)
 
         var int16Buffer = [Int16](repeating: 0, count: count)
         payload.withUnsafeBytes { raw in
@@ -303,8 +304,16 @@ enum AudioFrameBuilder {
             }
         }
 
-        // 小端字节序 → Int16（iOS 是小端序，直接映射即可）
-        vDSP_vflt16(int16Buffer, 1, &scale, &samples, 1, vDSP_Length(count))
+        // Int16 → Float。
+        //
+        // ★ vDSP_vflt16 的真实签名是 (Int16*, stride, Float*, stride, N) ——
+        //   它**只做类型转换，没有 scale 参数**（CI 首次编译抓出来的 API 幻觉：
+        //   原来把 &scale 当第 3 参传了进去，还把 [Float] 传给了 stride 位）。
+        //   归一化必须再用 vDSP_vsmul 单独做一步。
+        var floatBuffer = [Float](repeating: 0, count: count)
+        vDSP_vflt16(int16Buffer, 1, &floatBuffer, 1, vDSP_Length(count))
+        var normScale = 1.0 / Float(Int16.max)
+        vDSP_vsmul(floatBuffer, 1, &normScale, &samples, 1, vDSP_Length(count))
 
         return samples
     }

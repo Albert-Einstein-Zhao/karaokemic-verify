@@ -32,8 +32,7 @@
 //
 //  ⚠️ 缓冲区大小说明：
 //     iOS 的 AVAudioEngine inputNode tap 回调，给到的缓冲通常是这个大小。
-//     KaraokeMic 协议帧头 frameCount 字段是 u8（最大 255），故 frameSize 取 240
-//     = 5ms @48kHz。不要改回 960（20ms），会超协议上限导致音频被丢。
+//     20ms @48kHz = 960 样本。KaraokeMic 的协议默认就是 20ms。
 //═══════════════════════════════════════════════════════════════════════════
 
 import Accelerate
@@ -124,6 +123,7 @@ final class SignalChain {
         // ★ 2026-10-08 从 1024 扩到 4096：
         //   原来 1024 装不下 40ms 对齐量（1920 样本），
         //   取模后静默降级成 18.7ms，注释宣称的 40ms 从未生效。
+        //   4096 ≥ 1920 + 最大帧长 960，且是 2 的幂，取模开销低。
         self.referenceRing = [Float](repeating: 0, count: 4096)
 
         self.scratchBuffer = [Float](repeating: 0, count: frameSize * 2)
@@ -164,11 +164,15 @@ final class SignalChain {
             highPass.process(&work)
         }
 
-        // ── 阶段 [2]：输入增益 ──
+        // ── 阶段[2]：输入增益 ──
         // dB 转线性幅度：gain = 10^(dB/20)
         let inputGain = pow(10, params.inputGainDb / 20)
         var gainScalar = inputGain
-        vDSP_vsmul(work, 1, &gainScalar, &work, 1, vDSP_Length(n))
+        // vDSP 只吃裸指针；原地相乘（输入输出同址）
+        work.withUnsafeMutableBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_vsmul(base, 1, &gainScalar, base, 1, vDSP_Length(n))
+        }
 
         let inputLevel = dbfs(work)
 
@@ -203,7 +207,9 @@ final class SignalChain {
         }
 
         // ── 阶段 [9]：混响 ──
-        let final: [Float]
+        // ★ 必须是 var：下面混响分支里对它做逐元素赋值（取左声道），
+        //   声明成 let 会报 "cannot mutate subscript of immutable value"
+        var final: [Float]
         if params.reverbWet > 0.005 {
             reverb.update(parameters: ReverbParameters(
                 wet: params.reverbWet,
@@ -252,12 +258,25 @@ final class SignalChain {
         var ref = [Float](repeating: 0, count: n)
         let ringSize = referenceRing.count
 
+        // ★★ 两个 bug（2026-10-08 第十轮审查发现）
+        //
+        // (a) 容量不足：原来 referenceRing 只有 1024，
+        //     而 alignmentSamples = 48000*0.040 = 1920。
+        //     环形缓冲最多只能回溯 1023 样本(21.3ms)，
+        //     1920 % 1024 = 896 → 实际对齐量被静默降级成 ~18.7ms，
+        //     注释/documentation 宣称的 40ms 从来没真正生效。
+        //     → 现已在 init 里把环扩到 4096（≥1920 + 最大帧长 960）。
+        //
+        // (b) 符号错误：原来索引里是 `- i`，意味着参考信号在帧内**时间倒放**。
+        //     mic 的第 i 个样本对应时刻 t0+i，
+        //     它该配的参考样本是 t0+i-Δ（更早），在环里的位置应随 i **递增**：
+        //         环中 w-1 对应 t0
+        //         t0+i-Δ 距 t0 为 (i-Δ)，位置 = (w-1 + i - Δ) mod ringSize
+        //     → 正确写法是 `+ i`，不是 `- i`。
+        //     符号反了会导致滤波器无法拟合回声路径（AEC 结构性失效）。
+
         for i in 0..<n {
-            // ★★ 修复（2026-10-08 第十轮审查）
-            //   原来用 `- i`，导致参考信号在帧内时间倒放 → AEC 结构性失效。
-            //   mic 第 i 个样本对应 t0+i，应配 t0+i-Δ（更早），
-            //   在环里的位置随 i 递增，故应为 `+ i`。
-            //   环容量也从 1024 扩到 4096，见 init。
+            // 从「当前写指针 - alignmentSamples」往回读，随 i 递增
             let readIndex = ((referenceWriteIndex - alignmentSamples - 1 + i) % ringSize + ringSize) % ringSize
             ref[i] = referenceRing[readIndex]
         }
@@ -302,7 +321,11 @@ final class SignalChain {
     private func dbfs(_ signal: [Float]) -> Float {
         guard !signal.isEmpty else { return -120 }
         var rms: Float = 0
-        vDSP_rmsqv(signal, 1, &rms, vDSP_Length(signal.count))
+        // vDSP 只吃裸指针
+        signal.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_rmsqv(base, 1, &rms, vDSP_Length(signal.count))
+        }
         guard rms > 1e-10 else { return -120 }
         return 20 * log10(rms)
     }
@@ -357,7 +380,34 @@ struct SignalParameters: Equatable {
     var inputGainDb: Float = 0        // -20 ~ +20
 
     // 回声消除
-    var aecEnabled: Bool = true
+    //
+    // ★★★ 默认关闭（2026-10-09 第二十二轮，实测根因）★★★
+    //
+    // 现象：手机与盒子双端都显示「已连接」，电视却完全无声；
+    //       盒子端「麦克风电平」只有 -90dB 左右，只有对着麦克风吹气才跳动；
+    //       欠载次数持续上涨。手机 App 看起来一切正常。
+    //
+    // 决定性证据（盒子端加的供给诊断日志）：
+    //   【供给诊断】rate=48000样本/秒 pkts=400 perPkt=240 peak=1(-90dBFS)
+    //   ↑ 供给速率完全正常（48000/秒 = 正好够播放），
+    //     但**峰值只有 1**（满量程 32767）→ 送出去的数据几乎全是 0。
+    //   作为对照，PC 发满幅正弦时 peak=22936(-3dBFS) —— 证明盒子端链路没问题。
+    //
+    // 根因：AEC 的参考信号是「手机自己 40ms 前发出去的音频」
+    //       （见 makeAlignedReference / recordSentAudio）。
+    //       而麦克风此刻采集的**正是同一段人声**，两者强相关，
+    //       NLMS 于是收敛并把「直达人声」当成回声整个减掉：
+    //         · 唱歌/说话 = 准周期信号 → 极易被预测 → 被消除到 -90dB
+    //         · 吹气 = 宽带湍流 → 线性滤波器预测不了 → 反而残留最多
+    //       这正是用户观察到的「只有吹气才有一点点电平」。
+    //
+    // 为什么手机 UI 看不出来：输入电平取的是 **AEC 之前** 的信号
+    //       （AudioEngine 里用 out.inputLevelDb），所以它始终正常。
+    //
+    // K 歌场景本来就不需要手机端 AEC：麦克风要送出去的就是人声本身，
+    // 单麦克风无法区分「直达人声」和「电视喇叭回来的同一段人声」。
+    // 啸叫交给 HowlingSuppressor（窄带陷波）处理。
+    var aecEnabled: Bool = false
     var aecStrength: Float = 0.75     // 0 ~ 1
 
     // 啸叫抑制

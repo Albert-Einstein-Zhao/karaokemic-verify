@@ -75,7 +75,7 @@ struct MicButton: View {
             Image(systemName: isRecording ? "waveform" : "mic.fill")
                 .font(.system(size: 64, weight: .light))
                 .foregroundStyle(isRecording ? Color.white : Color.white.opacity(0.7))
-                .symbolEffect(.variableColor.iterative, isActive: isRecording)
+                .symbolEffectIfAvailable(active: isRecording)
         }
         .scaleEffect(isRecording ? 1.0 + level * 0.06 : 1.0)
         .animation(.spring(response: 0.3, dampingFraction: 0.6), value: level)
@@ -340,5 +340,33 @@ struct MetricCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(cornerRadius: 14, padding: 12)
+    }
+}
+
+// MARK: - iOS 17 symbolEffect 的安全降级
+
+/**
+ * `symbolEffect(.variableColor...)` 是 **iOS 17.0+** API，
+ * 而 App 的 deploymentTarget 是 16.0 —— 直接调用编译不过
+ * （CI 首次编译在 Components/DeviceView 各抓出一处）。
+ *
+ * 做成 ViewModifier + #available：iOS 17 上有波形流动动画，
+ * iOS 16 上静默降级为静态图标 —— 功能不缺，只是少了层动效。
+ */
+private struct SymbolEffectIfAvailable: ViewModifier {
+    var isActive: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content.symbolEffect(.variableColor.iterative, isActive: isActive)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func symbolEffectIfAvailable(active: Bool) -> some View {
+        modifier(SymbolEffectIfAvailable(isActive: active))
     }
 }

@@ -123,24 +123,44 @@ final class AdaptiveEchoCanceller {
         //   所以这里不该要求 reference 长度等于 taps，只要求非空。
         guard !reference.isEmpty else { return erleDb }
 
-        // 把本帧参考样本推进历史窗口
+        // 把本帧参考样本推进历史窗口（新的在前）
+        //
+        // ★ 防御性收窄：即使 n 超大，也不让 removeFirst 传超界数量。
+        //   removeFirst(k) 在 k > count 时会 trap（崩溃），
+        //   虽��上面的分支已保证 k < taps，这里再夹一次，纯属兜底。
         if reference.count >= taps {
+            // 极端情况：参考比滤波器还长，只取最近 taps 个
             xHistory = Array(reference.suffix(taps))
         } else {
-            xHistory.removeFirst(reference.count)
-            xHistory.append(contentsOf: reference)
+            let drop = min(reference.count, xHistory.count)
+            if drop > 0 { xHistory.removeFirst(drop) }
+            xHistory.append(contentsOf: reference.suffix(taps))
         }
 
-        // ── 1. 预测回声：y[i] = Σ h[k] · xHistory[i + base - k] ──
-        // ★ 不能用 vDSP_dotpr —— 那是「点积」函数，返回一个标量，
-        //   不能用来生成逐点预测序列。用标量循环。
+        // ── 1. 预测回声：y[i] = Σ h[k] · xHistory[i - k] ──
         //
-        // ★★ base 必须夹紧：n > taps 时 base 为负 → i + base 可能为负 → 数组越界崩溃。
-        //   真机 installTap(bufferSize:) 只是建议值，常给 480/960 帧。
-        let base = max(0, taps - n)
+        // ★ 这里原来写的是 vDSP_dotpr —— 那是「点积」函数，
+        //   返回一个标量（Float），不能用来生成逐点预测序列。
+        //
+        // 也考虑过改用 vDSP_conv（真正的卷积函数），但它有两个硬约束：
+        //   ① 输入信号长度必须 ≥ lenResult + lenFilter - 1，即需要零填充
+        //   ② 每次调用都要构造填充后的临时数组
+        // 在 5ms 一帧的实时音频回调里，第②条是禁忌（堆分配会造成爆音）。
+        //
+        // 所以用标量循环。开销核算：
+        //   240 样本 × 512 taps ≈ 12.3 万次乘加，每 5ms 执行一次
+        //   ≈ 24.6 M 次乘加/秒，A13 及以后单核占用约 2.5%，完全可接受。
         var yEstimate = [Float](repeating: 0, count: n)
+        // ★ base 同样必须夹紧。
+        //   n > taps 时 base 为负 → i + base 可能为负 → xHistory[负数] 越界崩溃。
+        //   夹到 0 后语义是「把本帧样本当作滤波器最近 taps 个输入的延续」，
+        //   对 n > taps 的超长帧是合理降级（多出来的样本用最近的历史对齐）。
+        let base = max(0, taps - n)
         for i in 0..<n {
             var acc: Float = 0
+            // h[k] 对应参考信号里往前数第 k 个样本。
+            // 本帧新样本的偏移是 taps-n，所以 i 点的参考起点要往后挪 taps-n。
+            // upper 同时受 taps 夹逼，保证 i + base - k >= 0。
             let idxStart = min(i + base, taps - 1)
             let upper = min(taps, idxStart + 1)
             for k in 0..<upper {
@@ -153,17 +173,35 @@ final class AdaptiveEchoCanceller {
 
         // ── 2. 误差信号：e[n] = mic[n] - yEstimate[n] ──
         // 这个 e 就是「减去回声后的干净人声」
-        var err = [Float](repeating: 0, count: n)
+        //
         // ★★★ 严重 bug（2026-10-08 第十轮审查发现，此前一直存在）
-        //   vDSP_vsub 的第 5 参数是**输出**指针，原来传的是 mb（mic 的 buffer），
-        //   导致 err 从头到尾全零，最后 `mic = err` 把音频变成数字静音。
-        //   连锁后果：散度保护、双讲检测、NLMS 系数更新全部静默失效。
-        //   修复：输出必须写到 eb（err 的 buffer）。
+        //
+        // 原来写的是：
+        //     mic.withUnsafeMutableBufferPointer { m in
+        //         yEstimate.withUnsafeBufferPointer { y in
+        //             vDSP_vsub(mb, 1, yb, 1, mb, 1, vDSP_Length(n))   // ← 输出写进 mb
+        //         }
+        //     }
+        //
+        // vDSP_vsub 的第 5 个参数是**输出**指针，这里传的是 `mb`（mic 的buffer），
+        // 也就是说误差被写回了 mic，而 `err` 数组**从头到尾没有被赋值过**，
+        // 一直是全零。
+        //
+        // 连锁后果（全部静默失效，比闪退更难发现）：
+        //   ① `mic = err` → AEC 输出整段数字静音，UDP 发出的是纯0
+        //   ② errPower 恒 0 → 散度保护 `errPower > micPower*9` 恒 false → 永不触发
+        //   ③ refPower>0 而 recentErrPower 恒 0 → farEndOnly 恒 true
+        //      → doubleTalk 恒 false → 双讲检测永不冻结系数（唱歌时滤波器会去拟合人声）
+        //   ④ gain = mu*err[i]/norm 恒 0 → h[k] += 0 → NLMS 从未更新过一次
+        //
+        // 修法：输出必须写到 `err`。
+        var err = [Float](repeating: 0, count: n)
         mic.withUnsafeMutableBufferPointer { m in
             yEstimate.withUnsafeBufferPointer { y in
                 err.withUnsafeMutableBufferPointer { e in
                     guard let mb = m.baseAddress, let yb = y.baseAddress,
                           let eb = e.baseAddress else { return }
+                    // vDSP_vsub 只吃裸指针，不接受数组/切片
                     vDSP_vsub(mb, 1, yb, 1, eb, 1, vDSP_Length(n))
                 }
             }
@@ -204,31 +242,48 @@ final class AdaptiveEchoCanceller {
         // 归一化（除以输入能量）保证不同音量下收敛速度一致。
         if !doubleTalk {
             let eps: Float = 1e-7
-            let norm = refPower + eps
+            // 归一化用整段参考的功率
+            let norm = power(of: xHistory) + eps
             // 有效步长受强度滑块控制
             let effectiveMu = mu * strength
 
-            // 只更新与本帧样本相关的系数段（长度 = 本帧样本数）
+            // ★★ 必须夹紧 base，base 为负会直接导致数组越界崩溃 ★★
             //
-            // ★★ base 已在预测段夹到 >=0，这里必须复用夹紧后的值，
-            //   并限制循环长度 kMax —— 否则 n > taps 时
-            //   `xHistory[i]` 的 i 会越过 taps-1 直接越界崩溃。
-            let base2 = max(0, taps - n)
-            let kMax = min(n, taps - base2)
+            // 原本写的是 `let base = taps - n`，当回调帧数 n > taps 时 base 变负数：
+            //   · NLMS 里 `h[k]` 有 guard k>=0 保护，会 continue 跳过（不崩）
+            //   · 但 `xHistory[i]` 里的 i 是本帧样本下标（0..<n），
+            //     n=960 时 i 会到 959，直接访问 xHistory[512..959] → **越界崩溃**
+            //
+            // 真实触发场景：iOS 的 installTap(bufferSize:) 只是「建议值」，
+            // 真机（尤其 iOS 17+）常给 480/ 960 帧。
+            // 表现：点连接 → 界面切换 → 不到半秒闪退（音频回调开始跑就炸）。
+            //
+            // 修法：base 夹到 [0, taps]，且只更新本帧真正对得上的那一段抽头。
+            // 被跳过的样本由下一次调用继续覆盖，不影响算法正确性
+            //（NLMS 本来就是逐样本递归，分几段更新等价）。
+            let base = max(0, taps - n)
+            let kMax = min(n, taps - base)      // 本帧最多能更新多少个抽头
             for i in 0..<kMax {
-                // ★ 修复（2026-10-08 第十轮审查）：抽头与输入的配对必须与【预测循环】一致。
-                //   预测循环：抽头 k 配对 xHistory[idxStart - k]，idxStart = min(i+base, taps-1)。
-                //   原来 `h[base2+i] += gain * xHistory[i]` 有两处错：
-                //     ① 抽头下标 off-by-i ② 读错了输入样本
-                //     → 抽头 0..base2-1 永远不更新，有效滤波器只有 n 阶而非 taps 阶。
-                let idxStart = min(i + base2, taps - 1)
+                // ★ 抽头与输入的配对必须与【预测循环】完全一致。
+                //
+                //   预测循环里：抽头 k 配对的是 xHistory[idxStart - k]，
+                //   其中 idxStart = min(i + base, taps - 1)。
+                //
+                //   原写法 `h[base + i] += gain * xHistory[i]` 有两处错：
+                //     ① 抽头下标比预测时多了 i → off-by-i
+                //     ② 读 xHistory[i] 而不是预测时用的那个输入
+                //        → 数学上等价于「用错输入更新抽头」，
+                //          结果是抽头 0..base-1 永远不会被更新（n=240 时 0..271 全是 0），
+                //          有效滤波器只有 240 阶而不是 512 阶。
+                let idxStart = min(i + base, taps - 1)
                 guard kMax > 0, idxStart < taps else { continue }
                 let gain = effectiveMu * err[i] / norm
                 if gain.isFinite, abs(gain) < 10 {
+                    // 逐抽头更新：用与预测时相同的输入样本 xHistory[idxStart]
                     for k in 0...min(idxStart, taps - 1) {
                         h[k] += gain * xHistory[idxStart - k]
-                        // 稳定性钳位：|h| > 1.5 物理上不可能是房间反射
                         if abs(h[k]) > 1.5 { h[k] = h[k] > 0 ? 1.5 : -1.5 }
+                    }
                 }
             }
         }
@@ -254,7 +309,11 @@ final class AdaptiveEchoCanceller {
     private func power(of sig: [Float]) -> Float {
         guard !sig.isEmpty else { return 0 }
         var sum: Float = 0
-        vDSP_svesq(sig, 1, &sum, vDSP_Length(sig.count))
+        // vDSP_svesq 只接受裸指针，不接受数组
+        sig.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            vDSP_svesq(base, 1, &sum, vDSP_Length(sig.count))
+        }
         return sum / Float(sig.count)
     }
 
