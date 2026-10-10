@@ -119,6 +119,8 @@ final class NetworkController: NSObject, ObservableObject {
 
     /// 本机 IPv4 地址（用于确定扫描哪个网段）
     private var localIP: String = ""
+    /// 本机网络接口一句话结论（UI 可见 —— 判断「手机在不在局域网里」）
+    @Published private(set) var ifaceSummary: String = "未知"
 
     /// 是否仍在扫描（控制 15 秒一轮的重扫）
     private var scanning = false
@@ -276,17 +278,58 @@ final class NetworkController: NSObject, ObservableObject {
 
     /// 解析手机当前的 IPv4 地址（确定扫描网段用）
     private func resolveLocalIP() {
+        let (wifi, cellular, all) = Self.interfaceSummary()
+
+        // ★ 第二十七轮：把「手机到底连着什么网」明明白白打进日志。
+        //
+        // 【为什么必须看这个】排查「手机连不上盒子」时，最容易忽略的就是
+        //   **手机自己根本不在局域网里** —— 蜂窝数据、Wi-Fi 掉了、连到别的
+        //   路由器、开了 VPN/私有中继，都会让「发往 192.168.1.x 的 UDP」
+        //   被内核扔进蜂窝默认路由的黑洞。此时 sendto **照样返回成功**
+        //   （内核只是接收了包），但包永远到不了盒子。
+        //   只看 sendto 返回值会得出「发出去了，是盒子的问题」的错误结论。
+        if let w = wifi {
+            localIP = w
+            ifaceSummary = "Wi-Fi \(w)"
+        } else if let c = cellular {
+            ifaceSummary = "⚠️ 只有蜂窝网 \(c)，没有 Wi-Fi 地址"
+        } else {
+            ifaceSummary = "⚠️ 未检测到任何 IPv4 地址"
+        }
+        if let c = cellular, wifi != nil {
+            ifaceSummary += "；蜂窝 \(c)"
+        }
+        NSLog("[Network] 接口清单: \(all)")
+        NSLog("[Network] 本机判定: \(ifaceSummary)")
+    }
+
+    /// 枚举所有 IPv4 接口。
+    /// - returns: (Wi-Fi 地址, 蜂窝地址, 全部接口清单)
+    ///
+    /// 接口命名约定（iOS）：`en0` = Wi-Fi，`pdp_ip0` = 蜂窝数据，
+    /// `lo0` = 回环，`utun*` = VPN 隧道。看到 utun 就说明用户开着 VPN ——
+    /// 而 VPN 会劫持默认路由，很多 VPN 默认不通局域网。
+    private static func interfaceSummary()
+        -> (wifi: String?, cellular: String?, all: String) {
         var head: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&head) == 0, let first = head else { return }
+        guard getifaddrs(&head) == 0, let first = head else {
+            return (nil, nil, "getifaddrs 失败")
+        }
         defer { freeifaddrs(head) }
 
+        var wifi: String?
+        var cellular: String?
+        var lines: [String] = []
         var ptr: UnsafeMutablePointer<ifaddrs>? = first
+
         while let current = ptr {
             let interface = current.pointee
 
             // ★ ifa_addr 是可选的，必须先解包
             if let addr = interface.ifa_addr,
                addr.pointee.sa_family == UInt8(AF_INET) {
+                // ifa_name 在 Swift 里是 IUO 指针，用 map 解包最稳妥
+                let name = interface.ifa_name.map { String(cString: $0) } ?? "?"
                 var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 let len = socklen_t(addr.pointee.sa_len != 0
                                     ? Int(addr.pointee.sa_len)
@@ -294,14 +337,20 @@ final class NetworkController: NSObject, ObservableObject {
                 getnameinfo(addr, len, &hostname, socklen_t(hostname.count),
                             nil, 0, NI_NUMERICHOST)
                 let ip = String(cString: hostname)
-                if ip.hasPrefix("192.168.") {
-                    localIP = ip
-                    NSLog("[Discovery] 手机 IP: \(ip)")
-                    break
+                lines.append("\(name)=\(ip)")
+
+                if name.hasPrefix("en") {
+                    // 可能有多个 en*，优先取 192.168./10./172. 这种内网地址
+                    if wifi == nil || (ip.hasPrefix("192.168.") && !wifi!.hasPrefix("192.168.")) {
+                        wifi = ip
+                    }
+                } else if name.hasPrefix("pdp_ip") {
+                    cellular = ip
                 }
             }
             ptr = interface.ifa_next
         }
+        return (wifi, cellular, lines.joined(separator: " "))
     }
 
     /// 【保留但已不再作为主要手段】广播 DISCOVER_QUERY 到 255.255.255.255:50002。
@@ -362,8 +411,16 @@ final class NetworkController: NSObject, ObservableObject {
 
         currentDevice = device
         connectLog.removeAll()
-        if localIP.isEmpty { resolveLocalIP() }
-        log("开始连接 \(device.name)  \(device.ip)（本机 IP \(localIP.isEmpty ? "未知" : localIP)）")
+        resolveLocalIP()
+        log("开始连接 \(device.name) → \(device.ip):\(device.controlPort)")
+        log("手机网络：\(ifaceSummary)")
+
+        // ── 0. 探路：独立于 hello 的 UDP 可达性验证 ──────────────────
+        //   用「扫描同款」的 discover_query 打 50002。这一步的成功/失败
+        //   能干净地把故障切成两半：
+        //     · 探路成功 + hello 无回音 → 网络没问题，是协议/端口的问题
+        //     · 探路也失败            → 手机根本发不出 UDP，别再怀疑盒子
+        probeReachability(to: device.ip)
 
         // ── 1. 音频面 socket（只发，实时线程用）──────────────────────
         let aFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -444,17 +501,123 @@ final class NetworkController: NSObject, ObservableObject {
         sendHello()
         log("已发送 hello，等待盒子回应…")
 
-        // ── 5. 超时兜底：4 秒没 ready 就明确报错 ──────────────────────
+        // ★ 第二十七轮：hello 重发 3 次（1.5s / 3.5s / 5.5s）。
+        //   UDP 不保证送达，首包丢掉是很常见的事（尤其刚唤醒 Wi-Fi 时）。
+        //   只发一次的话，一次偶然丢包就被误判成「盒子无响应」，
+        //   白白浪费好几轮排查。重发是 UDP 握手的标准做法。
+        for delay in [1.5, 3.5, 5.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, !self.state.isConnected,
+                      case .handshaking = self.state else { return }
+                self.log("重发 hello（第 \(Int(delay * 2 / 3)) 次重试）")
+                self.sendHello()
+            }
+        }
+
+        // ── 5. 超时兜底：8 秒没 ready 就明确报错（放宽到覆盖 3 次重发）──
         helloTimer?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             if !self.state.isConnected {
-                self.log("❌ 4 秒内没收到盒子回应")
+                self.log("❌ 8 秒内没收到盒子回应（已重发 3 次）")
                 self.state = .failed("盒子无响应：请确认盒子 App 已打开、且手机与盒子在同一 Wi-Fi")
             }
         }
         helloTimer = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: item)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ★★ UDP 探路（第二十七轮新增 —— 把「手机发不出」和「盒子没回」切开）
+    // ══════════════════════════════════════════════════════════════════
+    //
+    //  故障现场：手机日志停在「已发送 hello」，而盒子端 600 秒监听
+    //  **一个包都没收到**。sendto 明明返回成功，包却消失了 ——
+    //  说明 sendto 成功 ≠ 包真的出去了（可能被蜂窝默认路由/VPN/权限吞掉）。
+    //
+    //  探路用的是和「扫描」完全相同的姿势（bind + sendto 到 50002），
+    //  而盒子的 50002 已被 PC 探针反复验证过能收能回。
+    //  所以这一步的结果是可信的判决：
+    //    ✅ 有回音 → 手机→盒子 UDP 通路正常，问题在 hello 本身
+    //    ❌ 没回音 → 手机被 iOS 拦了/不在局域网，改盒子没用
+    // ══════════════════════════════════════════════════════════════════
+    private func probeReachability(to ip: String) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+
+            let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+            guard fd >= 0 else {
+                self.log("❌ 探路 socket 创建失败 errno=\(errno)")
+                return
+            }
+            defer { close(fd) }
+
+            var tv = timeval()
+            tv.tv_sec = 0
+            tv.tv_usec = 300_000
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                       socklen_t(MemoryLayout<timeval>.size))
+
+            // 必须 bind —— 没端口就收不到回包
+            var bindAddr = sockaddr_in()
+            bindAddr.sin_family = sa_family_t(AF_INET)
+            bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            bindAddr.sin_port = 0
+            bindAddr.sin_addr.s_addr = 0
+            withUnsafePointer(to: &bindAddr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    _ = Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+
+            var target = sockaddr_in()
+            target.sin_family = sa_family_t(AF_INET)
+            target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            target.sin_port = KaraokeProtocol.discoveryPort.bigEndian
+            target.sin_addr.s_addr = inet_addr(ip)
+
+            let payload = ControlFrameBuilder.build(
+                ControlMessage(
+                    cmd: "discover_query",
+                    data: ["clientName": .string(UIDevice.current.name)]
+                ),
+                type: .discoverQuery
+            )
+
+            let sent = payload.withUnsafeBytes { raw -> Int in
+                var t = target
+                return withUnsafePointer(to: &t) { p -> Int in
+                    p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        sendto(fd, raw.baseAddress, raw.count, 0, sa,
+                               socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+
+            if sent < 0 {
+                let why = Self.errnoText(errno)
+                self.log("❌ 探路包没发出去：\(why)（errno=\(errno)）")
+                return
+            }
+            self.log("探路包已发出（\(sent) 字节 → \(ip):\(KaraokeProtocol.discoveryPort)）")
+
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let deadline = Date().addingTimeInterval(1.5)
+            while Date() < deadline {
+                let n = recvfrom(fd, &buf, buf.count, 0, nil, nil)
+                if n > 0 {
+                    if let (header, _) = ControlFrameBuilder.parse(Data(buf[0..<n])),
+                       header.type == .discoverReply {
+                        self.log("✅ 探路成功：手机→盒子 UDP 可达（盒子有回音）")
+                    } else {
+                        self.log("⚠️ 收到回音但不是发现回复")
+                    }
+                    return
+                }
+                if errno != EAGAIN && errno != EWOULDBLOCK { break }
+            }
+            self.log("❌ 探路失败：包发出去了但盒子没回音 → 手机被 iOS 拦截或不在同一局域网")
+        }
     }
 
     /// 控制面接收循环（后台线程：阻塞 recv + 200ms 超时轮询）。
