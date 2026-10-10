@@ -86,6 +86,9 @@ final class NetworkController: NSObject, ObservableObject {
     //   之后 send/recv 都不用再填地址 —— 语义上正是我们想要的「一对一对端」。
     private var audioFd: Int32 = -1        // 音频面：只发（实时线程用）
     private var ctrlFd: Int32 = -1         // 控制面：收发
+    /// 目标地址（★ 第二十六轮：改用 sendto 姿势，不再用 connect）
+    private var audioTarget = sockaddr_in()
+    private var ctrlTarget = sockaddr_in()
     private var controlRunning = false     // 控制接收循环开关
     private let networkQueue = DispatchQueue(label: "com.xuebao.karamic.net", qos: .userInitiated)
 
@@ -359,7 +362,8 @@ final class NetworkController: NSObject, ObservableObject {
 
         currentDevice = device
         connectLog.removeAll()
-        log("开始连接 \(device.name)  \(device.ip)")
+        if localIP.isEmpty { resolveLocalIP() }
+        log("开始连接 \(device.name)  \(device.ip)（本机 IP \(localIP.isEmpty ? "未知" : localIP)）")
 
         // ── 1. 音频面 socket（只发，实时线程用）──────────────────────
         let aFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -373,17 +377,12 @@ final class NetworkController: NSObject, ObservableObject {
         aAddr.sin_port = device.port.bigEndian
         aAddr.sin_addr.s_addr = inet_addr(device.ip)
 
-        let aOk = withUnsafePointer(to: &aAddr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Darwin.connect(aFd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard aOk == 0 else {
-            log("❌ 连音频端口失败 errno=\(errno)")
-            close(aFd)
-            state = .failed("无法连到 \(device.ip):\(device.port)")
-            return
-        }
+        // ★ 第二十六轮：不再调 connect()，改成 sendto 姿势。
+        //   依据：用户真机上「扫描」用的 socket+sendto 是能发出包的
+        //   （盒子日志实证收到过 192.168.1.7 的 discover_query），
+        //   而 connect+send 这一套一个包都发不出去。理论上两者等价，
+        //   但 iOS 上实测行为不同 —— 统一成已验证可用的那一套。
+        audioTarget = aAddr
         // 实时音频线程里调 send，绝不能阻塞 → 设为非阻塞
         _ = fcntl(aFd, F_SETFL, fcntl(aFd, F_GETFL, 0) | O_NONBLOCK)
         var sndBuf: Int32 = 262_144
@@ -405,16 +404,26 @@ final class NetworkController: NSObject, ObservableObject {
         cAddr.sin_port = device.controlPort.bigEndian
         cAddr.sin_addr.s_addr = inet_addr(device.ip)
 
-        let cOk = withUnsafePointer(to: &cAddr) { ptr -> Int32 in
+        ctrlTarget = cAddr
+
+        // ★ 必须显式 bind：UDP socket 只有在**首次 sendto** 时才会被内核
+        //   自动绑到一个临时端口。而接收循环是在发 hello **之前**启动的 ——
+        //   如果那时 socket 还没有端口，recvfrom 会永远等不到盒子的回包
+        //   （绑定到「端口 0」= 没端口，收不到任何东西）。
+        //   显式 bind 到 0.0.0.0:0 让内核立刻分配端口，接收才真正生效。
+        //   （PC 端 probe_hello.py 也是先 bind 再 sendto —— 已验证可用的姿势。）
+        var bindAddr = sockaddr_in()
+        bindAddr.sin_family = sa_family_t(AF_INET)
+        bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        bindAddr.sin_port = 0                 // 让内核分配
+        bindAddr.sin_addr.s_addr = 0          // INADDR_ANY
+        let bOk = withUnsafePointer(to: &bindAddr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Darwin.connect(cFd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                Darwin.bind(cFd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard cOk == 0 else {
-            log("❌ 连控制端口失败 errno=\(errno)")
-            close(cFd); close(aFd); audioFd = -1
-            state = .failed("无法连到 \(device.ip):\(device.controlPort)")
-            return
+        if bOk != 0 {
+            log("❌ 绑定控制端口失败 errno=\(errno) \(Self.errnoText(errno))")
         }
         // 读超时 200ms —— 让接收循环能感知「该退出了」，而不是永久卡在 recv
         var tv = timeval()
@@ -455,7 +464,7 @@ final class NetworkController: NSObject, ObservableObject {
             var buf = [UInt8](repeating: 0, count: 4096)
             while true {
                 guard let self, self.controlRunning, self.ctrlFd >= 0 else { break }
-                let n = recv(self.ctrlFd, &buf, buf.count, 0)
+                let n = recvfrom(self.ctrlFd, &buf, buf.count, 0, nil, nil)
                 if n > 0 {
                     let data = Data(buf[0..<n])
                     self.handleControlPacket(data)
@@ -468,6 +477,24 @@ final class NetworkController: NSObject, ObservableObject {
                 }
             }
             NSLog("[NetworkController] 控制接收循环退出")
+        }
+    }
+
+    /// 把 errno 翻译成人话 —— 「静默失败」是最难查的故障，必须让人看见。
+    private static func errnoText(_ e: Int32) -> String {
+        switch e {
+        case EPERM:   return "EPERM 操作被拒绝 —— 几乎可以肯定是「本地网络」权限没给（到 iPhone 设置→隐私→本地网络 打开 K歌麦）"
+        case EACCES:  return "EACCES 权限不足 —— 请检查「本地网络」权限"
+        case ENETDOWN: return "ENETDOWN 网络不可用 —— Wi-Fi 是否断开？"
+        case ENETUNREACH: return "ENETUNREACH 网络不可达 —— 手机和盒子不在同一网段"
+        case EHOSTUNREACH: return "EHOSTUNREACH 主机不可达 —— 盒子 IP 是否变了？"
+        case ENOTCONN: return "ENOTCONN socket 未连接（sendto 姿势下不应出现）"
+        case EADDRNOTAVAIL: return "EADDRNOTAVAIL 地址不可用 —— IP 填写有误？"
+        case EAFNOSUPPORT: return "EAFNOSUPPORT 地址族不支持"
+        case EMSGSIZE: return "EMSGSIZE 包太大"
+        case ENOBUFS:  return "ENOBUFS 发送缓冲满"
+        case EAGAIN:   return "EAGAIN 暂时无法发送（非阻塞 socket 缓冲满）"
+        default:       return "errno=\(e)"
         }
     }
 
@@ -571,8 +598,14 @@ final class NetworkController: NSObject, ObservableObject {
         // ⚠️ 实时音频线程：这里只允许有一次 send 系统调用。
         //    不能碰 @Published、不能 DispatchQueue.main、不能加锁等待，
         //    否则 UI 每 5ms 被唤醒一次，界面会卡成幻灯片。
+        var target = audioTarget
         let n = packet.withUnsafeBytes { raw -> Int in
-            send(audioFd, raw.baseAddress, raw.count, 0)
+            withUnsafePointer(to: &target) { ptr -> Int in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    sendto(audioFd, raw.baseAddress, raw.count, 0, sa,
+                           socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
         }
         if n > 0 { sentPacketCount &+= 1 }
         sequence &+= 1
@@ -629,11 +662,21 @@ final class NetworkController: NSObject, ObservableObject {
             return
         }
         let data = ControlFrameBuilder.build(message)
+        var target = ctrlTarget
         let n = data.withUnsafeBytes { raw -> Int in
-            send(ctrlFd, raw.baseAddress, raw.count, 0)
+            withUnsafePointer(to: &target) { ptr -> Int in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    sendto(ctrlFd, raw.baseAddress, raw.count, 0, sa,
+                           socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
         }
         if n < 0 {
-            NSLog("[NetworkController] 控制发送失败 cmd=\(message.cmd) errno=\(errno)")
+            let why = Self.errnoText(errno)
+            NSLog("[NetworkController] 控制发送失败 cmd=\(message.cmd) errno=\(errno) \(why)")
+            log("❌ 发送 \(message.cmd) 失败：\(why)（errno=\(errno)）")
+        } else if message.cmd == ControlMessage.ControlCmd.hello {
+            log("hello 已发出（\(n) 字节，sendto 成功）")
         }
     }
 
