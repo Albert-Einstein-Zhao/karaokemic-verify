@@ -142,6 +142,10 @@ final class NetworkController: NSObject, ObservableObject {
     /// 连不上时最贵的动作是「猜」。这里把几种发送姿势**逐个真发一次**，
     /// 把每种的 errno 摆到 UI 上，一眼看出是「环境拦了」还是「我们自己写错了」。
     @Published private(set) var transportReport: [String] = []
+    /// 连接超时定时器（8 秒没 ready 就明确报错，绝不静默卡住）
+    private var helloTimer: DispatchWorkItem?
+    /// hello 重发定时器列表（★ 必须能逐个 cancel，否则断开后仍会往新连接塞脏包）
+    private var helloRetryItems: [DispatchWorkItem] = []
 
     private var sequence: UInt32 = 0
     private var nextExpectedSeq: UInt32 = 0

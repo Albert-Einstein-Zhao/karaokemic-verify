@@ -290,11 +290,12 @@ enum AudioFrameBuilder {
             rounding: .towardNearestInteger
         )
 
-        // Int16 → 小端字节流
-        int16Buffer.withUnsafeBufferPointer { src in
-            data.append(UnsafeRawBufferPointer(start: src.baseAddress!,
-                                               count: frameCount * 2))
-        }
+            // Int16 → 小端字节流
+            int16Buffer.withUnsafeBufferPointer { src in
+                guard frameCount > 0, let base = src.baseAddress else { return }
+                data.append(contentsOf: UnsafeRawBufferPointer(start: base,
+                                                               count: frameCount * 2))
+            }
 
         return data
     }
@@ -307,7 +308,7 @@ enum AudioFrameBuilder {
         guard payload.count >= count * 2 else { return [] }
 
         var samples = [Float](repeating: 0, count: count)
-        let scale = 1.0 / Float(Int16.max)
+        var scale = 1.0 / Float(Int16.max)
 
         var int16Buffer = [Int16](repeating: 0, count: count)
         payload.withUnsafeBytes { raw in
@@ -318,8 +319,13 @@ enum AudioFrameBuilder {
             }
         }
 
-        // 小端字节序 → Int16（iOS 是小端序，直接映射即可）
-        vDSP_vflt16(int16Buffer, 1, &scale, &samples, 1, vDSP_Length(count))
+        // Int16 → Float。
+        // ★ vDSP_vflt16 是 5 参：(输入, 输入步幅, 输出, 输出步幅, 长度)，
+        //   它**只做整数→浮点的类型转换，不做缩放**。
+        //   要拿到 [-1,1] 的音频采样，必须再用 vDSP_vsmul 乘 1/32767。
+        //   切勿用 vDSP_vclip（那是 float→float 裁剪，参数完全对不上）。
+        vDSP_vflt16(int16Buffer, 1, &samples, 1, vDSP_Length(count))
+        vDSP_vsmul(samples, 1, &scale, &samples, 1, vDSP_Length(count))
 
         return samples
     }
