@@ -23,6 +23,7 @@ struct DeviceView: View {
                     }
 
                     manualEntry
+                    transportCard
                     connectLogCard
                     diagnosticsCard
                 }
@@ -238,12 +239,16 @@ struct DeviceView: View {
                             .foregroundStyle(.white.opacity(0.4))
                     }
 
-                    ForEach(Array(app.network.connectLog.enumerated()), id: \.offset) { _, line in
-                        Text(line)
+                    // ★ 第二十九轮：直接用 LogLine 自带的稳定 UUID id。
+                    //   旧写法 ForEach(Array(log.enumerated()), id: \.offset)，
+                    //   一旦 removeFirst() 让列表左移，offset 身份整体错位，
+                    //   SwiftUI 按旧身份找下标 → index out of range 闪退。
+                    ForEach(app.network.connectLog) { line in
+                        Text(line.text)
                             .font(KaraokeTheme.monoFont(11))
-                            .foregroundStyle(line.hasPrefix("❌")
+                            .foregroundStyle(line.text.hasPrefix("❌")
                                              ? KaraokeTheme.danger
-                                             : (line.hasPrefix("✅")
+                                             : (line.text.hasPrefix("✅")
                                                 ? KaraokeTheme.success
                                                 : .white.opacity(0.75)))
                             .frame(maxWidth: .infinity, alignment: .leading)

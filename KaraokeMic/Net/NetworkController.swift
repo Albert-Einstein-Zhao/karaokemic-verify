@@ -15,6 +15,19 @@ import Darwin
 import Network
 import UIKit
 
+/// 连接日志的一行。
+///
+/// ★ 第二十九轮：之前 connectLog 是 [String]，DeviceView 里用
+///   `ForEach(Array(log.enumerated()), id: \.offset)` 渲染。
+///   而 connectLog 满了会 removeFirst() —— offset 身份整体位移，
+///   SwiftUI 会按旧身份去找已经不存在的下标 → 「index out of range」闪退。
+///   「再点一次连接就闪退」有一半是这个原因。
+struct LogLine: Identifiable {
+    let id = UUID()
+    let text: String
+    let at: Date = Date()
+}
+
 /// 设备发现结果。
 struct DiscoveredDevice: Identifiable, Equatable {
     let id: String         // "ip:port" 作为唯一标识
@@ -92,6 +105,44 @@ final class NetworkController: NSObject, ObservableObject {
     private var controlRunning = false     // 控制接收循环开关
     private let networkQueue = DispatchQueue(label: "com.xuebao.karamic.net", qos: .userInitiated)
 
+    // ★★ 第二十九轮：控制接收循环必须有自己的专用队列。
+    //
+    // 【在此之前它是跑在 networkQueue 上的】—— 而 networkQueue 是**串行**队列，
+    //   接收循环又是一个 `while true { recvfrom }` 永不退出的任务。
+    //
+    // 这一个决定造成了连锁灾难：
+    //   · 首次连接后 networkQueue 被**永久占死**
+    //   · 之后提交的 probeReachability() / scanSubnet() **永远排在队尾不执行**
+    //     → 用户看到「点连接没反应」
+    //   · disconnect() 里 delay 0.3s 的 close(dying) 也永远不执行 → fd 持续泄漏
+    //   · 反复重连把 fd 和僵尸线程越堆越多 → 「再点一次就闪退」
+    //
+    // 修法：接收循环独占一个队列，绝不能和「任务队列」共用。
+    private let ctrlQueue = DispatchQueue(label: "com.xuebao.karamic.ctrl")
+
+    /// 代际号：每次新建连接 +1，用它让旧接收循环自然退出。
+    ///
+    /// ★ 不能用 Bool 开关：第二次连接时 Bool 会被「先置 false 再置 true」，
+    ///   旧循环看到的还是 true → 不会退出，反而在**新 fd** 上继续 recv，
+    ///   于是两个线程抢同一个 fd。代际号是唯一的，天然避免了这个坑。
+    private var ctrlGeneration: UInt64 = 0
+
+    /// 音频线程专用的就绪标记。
+    ///
+    /// ★ 实时音频线程绝对不能读 `state` —— ConnectionState.failed 携带 String
+    ///   payload，主线程写 / 音频线程读 = 引用计数竞争 → EXC_BAD_ACCESS 闪退。
+    ///   Bool 是单字节值类型，没有引用计数，跨线程读最多读到旧值，不会崩。
+    private var audioReady = false
+
+    /// 连接过程日志（UI 可见 + NSLog 双写）—— 「卡在哪一步」现场定位的唯一手段。
+    @Published private(set) var connectLog: [LogLine] = []
+
+    /// UDP 发送姿势体检报告。
+    ///
+    /// 连不上时最贵的动作是「猜」。这里把几种发送姿势**逐个真发一次**，
+    /// 把每种的 errno 摆到 UI 上，一眼看出是「环境拦了」还是「我们自己写错了」。
+    @Published private(set) var transportReport: [String] = []
+
     private var sequence: UInt32 = 0
     private var nextExpectedSeq: UInt32 = 0
     private var pingTimer: Timer?
@@ -102,15 +153,30 @@ final class NetworkController: NSObject, ObservableObject {
     private var pendingHelloAck = false
 
     /// 连接超时定时器（4 秒没 ready 就明确报错，绝不静默卡住）
-    private var helloTimer: DispatchWorkItem?
+    func setConnected() {
+        helloTimer?.cancel()
+        helloTimer = nil
+        for item in helloRetryItems { item.cancel() }
+        helloRetryItems.removeAll()
+
+        state = .ready
+        audioReady = true          // 实时音频线程的就绪标记
+        scanning = false           // 已连上，停掉 15 秒一轮的后台重扫
+        startPingTimer()
+    }
+
+    func clearConnected() {
+        audioReady = false
+        helloTimer?.cancel()
+        helloTimer = nil
+        sentSeqSet.removeAll()
+        nextExpectedSeq = 0
+    }
 
     /// 实时音频线程专用的发送计数。
     /// ⚠️ 不能直接写 @Published packetsSent：那会每 5ms 触发一次 UI 重算，
     ///    界面会卡成幻灯片。由主线程 ping 定时器每 500ms 同步一次。
     private var sentPacketCount: Int = 0
-
-    /// 连接过程日志（UI 可见）—— 「卡在哪一步」现场定位的唯一手段。
-    @Published private(set) var connectLog: [String] = []
 
     /// 音频发送统计（本端）
     private var sentSeqSet: Set<UInt32> = []
@@ -219,15 +285,12 @@ final class NetworkController: NSObject, ObservableObject {
         // ── ① 发查询：向每个 IP 的 50002 发一个包 ──
         for i in 1...254 {
             let ip = "\(prefix).\(i)"
-            var addr = sockaddr_in()
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            addr.sin_port = KaraokeProtocol.discoveryPort.bigEndian   // 网络字节序
-            addr.sin_addr.s_addr = inet_addr(ip)                      // 已是网络字节序
+            guard var addr = Self.makeAddr(ip: ip, port: KaraokeProtocol.discoveryPort) else {
+                continue
+            }
 
             let sent = payload.withUnsafeBytes { raw -> Int in
-                var a = addr                                          // 需要可变副本
-                return withUnsafePointer(to: &a) { ptr -> Int in
+                return withUnsafePointer(to: &addr) { ptr -> Int in
                     ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                         sendto(fd, raw.baseAddress, raw.count, 0, sa,
                                socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -381,7 +444,53 @@ final class NetworkController: NSObject, ObservableObject {
     //  路由查找**强制限定在 Wi-Fi 接口**上，utun 再也抢不走。
     //  这是对症下药 —— 不是绕过权限，是把路由作用域钉对地方。
     // ══════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════
+    //  ★★ 安全构造 sockaddr_in（第二十九轮 —— 换掉 inet_addr）
+    // ══════════════════════════════════════════════════════════════════
+    //
+    //  【inet_addr 的坑】它解析失败时返回 INADDR_NONE = 0xFFFFFFFF，
+    //  而这个值**正好是合法广播地址 255.255.255.255**，两者无法区分。
+    //  用户手输 IP 时只要掺进一个空格/全角字符/换行（输入法很容易做到），
+    //  包就变成「往广播发」→ iOS 上没设 SO_BROADCAST，
+    //  报出来的 errno 是 EACCES 或 EHOSTUNREACH 这类**误导性**错误，
+    //  会直接把排查方向带偏。它还接受 "192.168.1.010" 这种八进制写法。
+    //
+    //  inet_pton 只接受标准点分十进制，失败就是失败，返回 nil 明确报错。
+    // ══════════════════════════════════════════════════════════════════
+    private static func makeAddr(ip: String, port: UInt16) -> sockaddr_in? {
+        let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian          // 网络字节序（arm64 是小端）
+
+        guard inet_pton(AF_INET, clean, &addr.sin_addr) == 1 else {
+            return nil
+        }
+        return addr
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ★★ 接口钉扎 —— 第二十九轮改为「默认关闭 + 结果上 UI」
+    // ══════════════════════════════════════════════════════════════════
+    //
+    //  【第二十八轮的教训】IP_BOUND_IF 是我上一轮为了治「VPN 抢路由」加的，
+    //  但它是**自伤**：interfaceSummary() 只按 `hasPrefix("en")` 挑接口，
+    //  并没有校验「这个接口上确实挂着通往目标网段的路由」。
+    //  一旦钉到不带该路由的接口（iOS 上还有 awdl0/llw0/anpi*/utun* 等），
+    //  内核的 ifscope 路由查找失败，**返回的正是 EHOSTUNREACH(65)** ——
+    //  和我们看到的 errno 完全一致。
+    //
+    //  【另一个致命问题】setsockopt 失败时只写了 NSLog，
+    //  UI 上一个字都看不到 → 等于闭着眼睛改。
+    //
+    //  所以这一轮：默认关闭，且结果必须进 UI 日志，由体检报告决定要不要开。
+    // ══════════════════════════════════════════════════════════════════
+    /// 接口钉扎总开关。体检报告证明「不钉发不出」时才打开。
+    private var pinToWiFiEnabled = false
+
     private func pinToWiFi(_ fd: Int32, label: String) {
+        guard pinToWiFiEnabled else { return }
         let name = wifiIface.isEmpty ? "en0" : wifiIface
         let idx = if_nametoindex(name)
         guard idx > 0 else {
@@ -426,8 +535,15 @@ final class NetworkController: NSObject, ObservableObject {
             ?? Float(KaraokeProtocol.controlPort)
         let version = dict?["appVersion"]?.stringValue ?? message.appVersion ?? "?"
 
-        let port = UInt16(portValue)
-        let ctrlPort = UInt16(ctrlValue)
+        let pv = Int(portValue)
+        let cv = Int(ctrlValue)
+        guard pv >= 0, pv <= 65535, cv >= 0, cv <= 65535 else {
+            // ★ UInt16(Float) 越界会直接 trap。盒子回一个 port:70000 就把 App 打崩。
+            NSLog("[Network] 发现回复里的端口超范围，丢弃：port=\(portValue) ctrl=\(ctrlValue)")
+            return
+        }
+        let port = UInt16(pv)
+        let ctrlPort = UInt16(cv)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -461,7 +577,8 @@ final class NetworkController: NSObject, ObservableObject {
         log("开始连接 \(device.name) → \(device.ip):\(device.controlPort)")
         log("手机网络：\(ifaceSummary)")
 
-        // ── 0. 探路：独立于 hello 的 UDP 可达性验证 ──────────────────
+        // ── 0. 发送姿势体检（穷举，穷举出到底哪种姿势能发）────────────
+        probeTransportMatrix(to: device.ip)
         //   用「扫描同款」的 discover_query 打 50002。这一步的成功/失败
         //   能干净地把故障切成两半：
         //     · 探路成功 + hello 无回音 → 网络没问题，是协议/端口的问题
@@ -474,24 +591,22 @@ final class NetworkController: NSObject, ObservableObject {
             state = .failed("创建音频 socket 失败")
             return
         }
-        var aAddr = sockaddr_in()
-        aAddr.sin_family = sa_family_t(AF_INET)
-        aAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        aAddr.sin_port = device.port.bigEndian
-        aAddr.sin_addr.s_addr = inet_addr(device.ip)
-
-        // ★ 第二十六轮：不再调 connect()，改成 sendto 姿势。
-        //   依据：用户真机上「扫描」用的 socket+sendto 是能发出包的
-        //   （盒子日志实证收到过 192.168.1.7 的 discover_query），
-        //   而 connect+send 这一套一个包都发不出去。理论上两者等价，
-        //   但 iOS 上实测行为不同 —— 统一成已验证可用的那一套。
+        // ★ 换成 makeAddr：IP 一旦不合法就明确报错，
+        //   而不是像 inet_addr 那样悄悄变成 255.255.255.255 广播包。
+        guard let aAddr = Self.makeAddr(ip: device.ip, port: device.port) else {
+            close(aFd)
+            let msg = "IP 地址不合法：\(device.ip)"
+            log("❌ \(msg)")
+            state = .failed(msg)
+            return
+        }
         audioTarget = aAddr
         // 实时音频线程里调 send，绝不能阻塞 → 设为非阻塞
         _ = fcntl(aFd, F_SETFL, fcntl(aFd, F_GETFL, 0) | O_NONBLOCK)
         var sndBuf: Int32 = 262_144
         setsockopt(aFd, SOL_SOCKET, SO_SNDBUF, &sndBuf,
                    socklen_t(MemoryLayout<Int32>.size))
-        // ★ 钉到 Wi-Fi：音频流走蜂窝/VPN 就全完了
+        // ★ 默认不再钉接口（详见 pinToWiFi 的说明）
         pinToWiFi(aFd, label: "音频")
         audioFd = aFd
         log("音频通道就绪 → \(device.ip):\(device.port)")
@@ -503,12 +618,14 @@ final class NetworkController: NSObject, ObservableObject {
             state = .failed("创建控制 socket 失败")
             return
         }
-        var cAddr = sockaddr_in()
-        cAddr.sin_family = sa_family_t(AF_INET)
-        cAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        cAddr.sin_port = device.controlPort.bigEndian
-        cAddr.sin_addr.s_addr = inet_addr(device.ip)
-
+        guard let cAddr = Self.makeAddr(ip: device.ip, port: device.controlPort) else {
+            close(aFd); audioFd = -1
+            close(cFd)
+            let msg = "IP 地址不合法：\(device.ip)"
+            log("❌ \(msg)")
+            state = .failed(msg)
+            return
+        }
         ctrlTarget = cAddr
 
         // ★ 必须显式 bind：UDP socket 只有在**首次 sendto** 时才会被内核
@@ -555,13 +672,16 @@ final class NetworkController: NSObject, ObservableObject {
         //   UDP 不保证送达，首包丢掉是很常见的事（尤其刚唤醒 Wi-Fi 时）。
         //   只发一次的话，一次偶然丢包就被误判成「盒子无响应」，
         //   白白浪费好几轮排查。重发是 UDP 握手的标准做法。
-        for delay in [1.5, 3.5, 5.5] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, !self.state.isConnected,
-                      case .handshaking = self.state else { return }
-                self.log("重发 hello（第 \(Int(delay * 2 / 3)) 次重试）")
+        for delay in [1.8, 4.0, 6.5] {
+            let retry = DispatchWorkItem { [weak self] in
+                guard let self,
+                      !self.state.isConnected,
+                      self.state == .handshaking else { return }
                 self.sendHello()
             }
+            helloRetryItems.append(retry)
+            DispatchQueue.global(qos: .utility)
+                .asyncAfter(deadline: .now() + delay, execute: retry)
         }
 
         // ── 5. 超时兜底：8 秒没 ready 就明确报错（放宽到覆盖 3 次重发）──
@@ -673,26 +793,189 @@ final class NetworkController: NSObject, ObservableObject {
         }
     }
 
-    /// 控制面接收循环（后台线程：阻塞 recv + 200ms 超时轮询）。
-    private func startControlReceiveLoop() {
-        controlRunning = true
+    // ══════════════════════════════════════════════════════════════════
+    //  ★★ UDP 发送姿势体检（第二十九轮新增 —— 一次性穷举，不再逐个猜）
+    // ══════════════════════════════════════════════════════════════════
+    //
+    //  【为什么要做这个】前面连续三轮都是「改一处 → CI 编译 15 分钟 →
+    //   用户手动签名安装 → 还是失败」，每一轮只能验证一个猜想，代价太高。
+    //
+    //  这一轮改成：把几种发送姿势**逐个真发一次**，errno 原样摆在 UI 上。
+    //  一次安装把所有可能性一次性切干净：
+    //    · P1 通                      → UDP 本身没问题，是别的地方出错
+    //    · P1 不通但 P2 通            → 之前 28 轮的「钉接口」的确是自伤
+    //    · UDP 全不通但 P4(TCP) 通    → 整个 App 的 socket 没有本地网络权限
+    //    · 全不通，连 P4 也不通       → App 进程的网络栈被彻底隔离
+    // ══════════════════════════════════════════════════════════════════
+    func probeTransportMatrix(to ip: String) {
+        transportReport.removeAll()
         networkQueue.async { [weak self] in
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while true {
-                guard let self, self.controlRunning, self.ctrlFd >= 0 else { break }
-                let n = recvfrom(self.ctrlFd, &buf, buf.count, 0, nil, nil)
-                if n > 0 {
-                    let data = Data(buf[0..<n])
-                    self.handleControlPacket(data)
-                } else if errno == EAGAIN || errno == EWOULDBLOCK {
-                    continue            // 200ms 读超时，正常继续
-                } else if errno == EBADF {
-                    break               // fd 已被关闭
-                } else {
-                    usleep(20_000)      // 未知错误：让出 CPU，避免忙等烧电
+            guard let self else { return }
+            let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            var results: [String] = []
+            results.append(self.probeUDP(label: "P1 裸sendto", ip: clean,
+                                         port: KaraokeProtocol.controlPort,
+                                         pinned: false, useConnect: false))
+            results.append(self.probeUDP(label: "P2 钉接口sendto", ip: clean,
+                                         port: KaraokeProtocol.controlPort,
+                                         pinned: true, useConnect: false))
+            results.append(self.probeUDP(label: "P3 connect+send", ip: clean,
+                                         port: KaraokeProtocol.controlPort,
+                                         pinned: false, useConnect: true))
+            results.append(self.probeTCPRouting(ip: clean))
+
+            DispatchQueue.main.async {
+                self.transportReport = results
+            }
+        }
+    }
+
+    /// 单次 UDP 发送试验，返回一行给人看的结果。
+    private func probeUDP(label: String, ip: String, port: UInt16,
+                          pinned: Bool, useConnect: Bool) -> String {
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            return "\(label)：socket 创建失败 errno=\(errno)"
+        }
+        defer { close(fd) }
+
+        guard var addr = Self.makeAddr(ip: ip, port: port) else {
+            return "\(label)：IP 地址不合法"
+        }
+
+        if pinned {
+            let name = wifiIface.isEmpty ? "en0" : wifiIface
+            if let idx = if_nametoindex(name), idx > 0 {
+                var index = idx
+                setsockopt(fd, IPPROTO_IP, Int32(25), &index,
+                           socklen_t(MemoryLayout<UInt32>.size))
+            } else {
+                return "\(label)：找不到接口 \(name)（if_nametoindex 失败）"
+            }
+        }
+
+        let payload = ControlFrameBuilder.build(
+            ControlMessage(cmd: "probe",
+                           data: ["who": .string(UIDevice.current.name)]),
+            type: .control
+        )
+
+        var n: Int
+        if useConnect {
+            n = withUnsafePointer(to: &addr) { p -> Int in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    if Darwin.connect(fd, sa,
+                                      socklen_t(MemoryLayout<sockaddr_in>.size)) != 0 {
+                        return -1
+                    }
+                    return payload.withUnsafeBytes { raw -> Int in
+                        Darwin.send(fd, raw.baseAddress, raw.count, 0)
+                    }
                 }
             }
-            NSLog("[NetworkController] 控制接收循环退出")
+        } else {
+            n = payload.withUnsafeBytes { raw -> Int in
+                withUnsafePointer(to: &addr) { p -> Int in
+                    p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        sendto(fd, raw.baseAddress, raw.count, 0, sa,
+                               socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+        }
+
+        guard n >= 0 else {
+            let e = errno          // 立刻存，别再被别的调用覆写
+            return "\(label)：❌ \(Self.errnoText(e))"
+        }
+        return "\(label)：✅ 发出 \(n) 字节"
+    }
+
+    /// TCP 路由层判定 —— 判断「本地网络权限」的黄金标准。
+    ///
+    /// 为什么它比 UDP 可靠：UDP 的 sendto 成功只代表内核收下了包，
+    /// 不代表路由查找成功。而 TCP 握手要真正完成一次双向往返：
+    ///   · connect 成功         → 完整双向 IP 连通
+    ///   · ECONNREFUSED         → 对端回了 RST，**证明双向路由完全通**
+    ///                            （50001 是盒子的 UDP 口，TCP 去连必然被拒，
+    ///                             但能收到 RST 就说明 IP/路由/ARP 全没问题）
+    ///   · ETIMEDOUT            → 包发出去了但没人回（被防火墙丢）
+    ///   · EHOSTUNREACH         → 路由层失败，和目标是不是开机无关
+    private func probeTCPRouting(ip: String) -> String {
+        let sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard sock >= 0 else {
+            return "P4 TCP路由：socket 创建失败 errno=\(errno)"
+        }
+        defer { close(sock) }
+
+        // 3 秒握手超时，别卡住整个体检
+        var tv = timeval()
+        tv.tv_sec = 3
+        tv.tv_usec = 0
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv,
+                   socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                   socklen_t(MemoryLayout<timeval>.size))
+
+        guard var addr = Self.makeAddr(ip: ip, port: KaraokeProtocol.controlPort) else {
+            return "P4 TCP路由：IP 地址不合法"
+        }
+
+        let r = withUnsafePointer(to: &addr) { p -> Int32 in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        if r == 0 { return "P4 TCP路由：✅ connect 成功——双向 IP 完全连通" }
+
+        let e = errno
+        switch e {
+        case ECONNREFUSED:
+            return "P4 TCP路由：✅ ECONNREFUSED——收到对端 RST，双向路由完全通"
+        case ETIMEDOUT:
+            return "P4 TCP路由：⚠️ ETIMEDOUT——包发出去了但无人应答（可能被防火墙丢）"
+        case EHOSTUNREACH:
+            return "P4 TCP路由：❌ EHOSTUNREACH——路由层失败，本机找不到去往该 IP 的路"
+        case ENETDOWN:
+            return "P4 TCP路由：❌ ENETDOWN——Wi-Fi 网络接口不可用"
+        default:
+            return "P4 TCP路由：❌ errno=\(e)"
+        }
+    }
+
+    /// 控制面接收循环（专用队列：阻塞 recv + 200ms 超时轮询）。
+    private func startControlReceiveLoop() {
+        controlRunning = true
+
+        // ★ 捕获「代际号 + fd」的快照。
+        //   循环里只认这两个局部常量，不看实例属性 —— 这样即使又建立了新连接，
+        //   老循环也不会跑到新 fd 上去跟别人抢（旧写法用 Bool 开关就会）。
+        let gen = ctrlGeneration
+        let fd = ctrlFd
+        guard fd >= 0 else { return }
+
+        ctrlQueue.async { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while let self, self.ctrlGeneration == gen {
+                let n = recvfrom(fd, &buf, buf.count, 0, nil, nil)
+                if n > 0 {
+                    self.handleControlPacket(Data(buf[0..<n]))
+                } else if n == 0 {
+                    // 零长 UDP 包是合法的 —— 但此时 errno 是**上一次调用的脏值**，
+                    // 拿它去判断就会误判成超时或错误，必须单独处理。
+                    continue
+                } else {
+                    let e = errno        // 立刻存：NSLog 之类的调用会改 errno
+                    if e == EAGAIN || e == EWOULDBLOCK {
+                        continue         // 200ms 读超时，正常继续
+                    }
+                    if e == EBADF { break }   // fd 已被关闭
+                    usleep(20_000)            // 未知错误：让出 CPU，避免忙等烧电
+                }
+            }
+            NSLog("[NetworkController] 控制接收循环退出 gen=\(gen)")
         }
     }
 
@@ -719,7 +1002,7 @@ final class NetworkController: NSObject, ObservableObject {
         NSLog("[Connect] \(text)")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.connectLog.append(text)
+            self.connectLog.append(LogLine(text: text))
             if self.connectLog.count > 12 { self.connectLog.removeFirst() }
         }
     }
@@ -737,6 +1020,17 @@ final class NetworkController: NSObject, ObservableObject {
 
     private func handleControlPacket(_ data: Data) {
         guard let (header, message) = ControlFrameBuilder.parse(data) else { return }
+
+        // ★★ 第二十九轮补上的一行 —— 这才是最要命的漏网之鱼。
+        //
+        // 【在此之前】lastAudioReceivedAt 只在属性声明时初始化过一次，
+        //   全项目再也没有任何地方给它赋值。于是 App 运行超过 2 秒后，
+        //   checkConnectionHealth() 里的
+        //       Date().timeIntervalSince(lastAudioReceivedAt) > 2.0
+        //   **恒为真**。结果就是：任何一次成功连接，
+        //   最多活 1 秒就会被判「连接超时」掐断。
+        //   不修这条，就算这一轮连上了，也立刻会掉。
+        lastAudioReceivedAt = Date()
 
         DispatchQueue.main.async {
             switch header.type {
@@ -769,17 +1063,13 @@ final class NetworkController: NSObject, ObservableObject {
             // 盒子已预填充缓冲，可以正式开始
             self.log("✅ 盒子已就绪，开始传送人声")
             DispatchQueue.main.async {
-                self.state = .ready
-                self.scanning = false      // 已连上，停掉 15 秒一轮的后台重扫
-                self.startPingTimer()
+                self.setConnected()
             }
-            // 重置序列号统计
-            sentSeqSet.removeAll()
-            nextExpectedSeq = 0
 
         case "error":
             let err = msg.data?["error"]?.stringValue ?? "unknown"
             DispatchQueue.main.async {
+                self.clearConnected()
                 self.state = .failed(err)
             }
 
@@ -804,8 +1094,12 @@ final class NetworkController: NSObject, ObservableObject {
     /// ⚠️ 这个方法会在实时音频线程被调用，
     ///    所以不能做重活（不能加锁等待、不能 print、不能 JSON 编码）。
     ///    NWConnection.send 是非阻塞的，符合要求。
+    /// ⚠️ 这里读的是 audioReady（Bool），**不是** state。
+    ///   ConnectionState.failed 携带 String payload，主线程写 / 音频线程读
+    ///   会构成引用计数的并发竞争 → EXC_BAD_ACCESS 闪退。
+    ///   Bool 没有引用计数，最坏情况是读到上一帧的旧值，不会崩。
     func sendAudioFrame(samples: [Float], sampleRate: UInt32 = 48000) {
-        guard audioFd >= 0, state == .ready else { return }
+        guard audioFd >= 0, audioReady else { return }
 
         let packet = AudioFrameBuilder.build(
             from: samples, seq: sequence, sampleRate: sampleRate
@@ -858,6 +1152,8 @@ final class NetworkController: NSObject, ObservableObject {
     private func handlePong(_ data: Data) {
         guard let (header, message) = ControlFrameBuilder.parse(data) else { return }
         let t0Double = message?.data?["t0"]?.floatValue ?? 0
+        // ★ 数据来自网络：负值 / NaN 直接喂给 UInt64() 会 trap（可被远端打崩）
+        guard t0Double >= 0, t0Double.isFinite else { return }
         let t0 = UInt64(t0Double)
         let t1 = DispatchTime.now().uptimeNanoseconds
 
@@ -888,9 +1184,13 @@ final class NetworkController: NSObject, ObservableObject {
             }
         }
         if n < 0 {
-            let why = Self.errnoText(errno)
-            NSLog("[NetworkController] 控制发送失败 cmd=\(message.cmd) errno=\(errno) \(why)")
-            log("❌ 发送 \(message.cmd) 失败：\(why)（errno=\(errno)）")
+            // ★ errno 必须在系统调用后**立刻**取。
+            //   NSLog 本身是一次系统调用，很可能把 errno 覆写掉 ——
+            //   旧写法在 NSLog 之后再读一次 errno，那个值已经不可信了。
+            let e = errno
+            let why = Self.errnoText(e)
+            NSLog("[NetworkController] 控制发送失败 cmd=\(message.cmd) errno=\(e) \(why)")
+            log("❌ 发送 \(message.cmd) 失败：\(why)（errno=\(e)）")
         } else if message.cmd == ControlMessage.ControlCmd.hello {
             log("hello 已发出（\(n) 字节，sendto 成功）")
         }
@@ -931,21 +1231,32 @@ final class NetworkController: NSObject, ObservableObject {
         pingTimer = nil
         helloTimer?.cancel()
         helloTimer = nil
+        // ★ 之前只 cancel 了 helloTimer，重发 hello 的定时器没人管：
+        //   断开之后它们照样到点执行 sendHello()，往一个新的连接里塞脏包。
+        for item in helloRetryItems { item.cancel() }
+        helloRetryItems.removeAll()
 
         // 礼貌告别（此时 ctrlFd 还有效）
         if ctrlFd >= 0 {
             sendControl(ControlMessage(cmd: ControlMessage.ControlCmd.bye))
         }
 
+        // ★ 代际号 +1：让仍在跑的旧接收循环自然退出
+        ctrlGeneration &+= 1
+        audioReady = false
         controlRunning = false
+
         if audioFd >= 0 { close(audioFd); audioFd = -1 }
 
-        // 控制 fd 要等接收线程退出后再关，否则 recv 会用到已关闭的 fd
-        let dying = ctrlFd
-        ctrlFd = -1
-        if dying >= 0 {
-            networkQueue.asyncAfter(deadline: .now() + 0.3) { close(dying) }
-        }
+        // ★ 直接关，不再延迟 0.3 秒。
+        //   旧写法是把 close 丢给 networkQueue.asyncAfter —— 而 networkQueue
+        //   早就被接收循环永久占死了（详见 ctrlQueue 的说明），
+        //   这个 close **从来就没有执行过**，于是每次重连都泄漏一个 fd，
+        //   反复几次就把 fd 堆到上限 —— 「再点一次就闪退」就是从这来的。
+        //
+        //   Darwin 上关闭一个正在 recvfrom 的 fd 是安全的（recv 立刻返回
+        //   EBADF），因为没有 **已有**
+        if ctrlFd >= 0 { close(ctrlFd); ctrlFd = -1 }
 
         currentDevice = nil
         sequence = 0
