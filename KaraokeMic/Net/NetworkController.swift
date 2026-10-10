@@ -119,6 +119,8 @@ final class NetworkController: NSObject, ObservableObject {
 
     /// 本机 IPv4 地址（用于确定扫描哪个网段）
     private var localIP: String = ""
+    /// Wi-Fi 接口名（en0/en1，由 interfaceSummary 枚举得出）
+    private var wifiIface: String = ""
     /// 本机网络接口一句话结论（UI 可见 —— 判断「手机在不在局域网里」）
     @Published private(set) var ifaceSummary: String = "未知"
 
@@ -202,6 +204,9 @@ final class NetworkController: NSObject, ObservableObject {
         tv.tv_sec = 0
         tv.tv_usec = 300_000
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        // ★ 钉到 Wi-Fi：扫描也要防 VPN 抢路由
+        pinToWiFi(fd, label: "扫描")
 
         let payload = ControlFrameBuilder.build(
             ControlMessage(
@@ -299,6 +304,9 @@ final class NetworkController: NSObject, ObservableObject {
         if let c = cellular, wifi != nil {
             ifaceSummary += "；蜂窝 \(c)"
         }
+        if !wifiIface.isEmpty {
+            ifaceSummary += "（\(wifiIface)）"
+        }
         NSLog("[Network] 接口清单: \(all)")
         NSLog("[Network] 本机判定: \(ifaceSummary)")
     }
@@ -309,7 +317,7 @@ final class NetworkController: NSObject, ObservableObject {
     /// 接口命名约定（iOS）：`en0` = Wi-Fi，`pdp_ip0` = 蜂窝数据，
     /// `lo0` = 回环，`utun*` = VPN 隧道。看到 utun 就说明用户开着 VPN ——
     /// 而 VPN 会劫持默认路由，很多 VPN 默认不通局域网。
-    private static func interfaceSummary()
+    private func interfaceSummary()
         -> (wifi: String?, cellular: String?, all: String) {
         var head: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&head) == 0, let first = head else {
@@ -343,6 +351,7 @@ final class NetworkController: NSObject, ObservableObject {
                     // 可能有多个 en*，优先取 192.168./10./172. 这种内网地址
                     if wifi == nil || (ip.hasPrefix("192.168.") && !wifi!.hasPrefix("192.168.")) {
                         wifi = ip
+                        wifiIface = name          // ★ 记住接口名，socket 要钉在它上面
                     }
                 } else if name.hasPrefix("pdp_ip") {
                     cellular = ip
@@ -351,6 +360,43 @@ final class NetworkController: NSObject, ObservableObject {
             ptr = interface.ifa_next
         }
         return (wifi, cellular, lines.joined(separator: " "))
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ★★ 接口钉扎（第二十八轮新增 —— 治「VPN 抢默认路由」）
+    // ══════════════════════════════════════════════════════════════════
+    //
+    //  【现象】手机 ping 得通、ARP 也学得到（系统级网络全通），
+    //  但 App 里 sendto 照样 EHOSTUNREACH(errno=65)。
+    //
+    //  【根因】iOS 是「作用域路由」（scoped routing）：手机上只要挂着
+    //  任何 VPN/加速器（LetsTAP、UU、小火箭、Cloudflare WARP、iCloud
+    //  私有中继……），它们都会建一条 utun 接口并抢走**默认路由**。
+    //  普通 App 的 socket 走「默认作用域」→ 包被塞进 utun →
+    //  VPN 服务端回「不可达」→ 内核把 EHOSTUNREACH 还给我们。
+    //  而 ping 回包是内核在收包接口上直接生成的，不走默认作用域，
+    //  所以「ping 得通但 App 发不出」这个矛盾完全成立。
+    //
+    //  【药方】IP_BOUND_IF：BSD socket 专属的接口钉扎，把 socket 的
+    //  路由查找**强制限定在 Wi-Fi 接口**上，utun 再也抢不走。
+    //  这是对症下药 —— 不是绕过权限，是把路由作用域钉对地方。
+    // ══════════════════════════════════════════════════════════════════
+    private func pinToWiFi(_ fd: Int32, label: String) {
+        let name = wifiIface.isEmpty ? "en0" : wifiIface
+        let idx = if_nametoindex(name)
+        guard idx > 0 else {
+            NSLog("[Network] [\(label)] if_nametoindex(\(name)) 失败 errno=\(errno)")
+            return
+        }
+        var index = idx
+        // IP_BOUND_IF = 25（netinet/in.h）。不用系统符号名，防 iOS 版本差异。
+        let kIPBoundIf: Int32 = 25
+        if setsockopt(fd, IPPROTO_IP, kIPBoundIf, &index,
+                      socklen_t(MemoryLayout<UInt32>.size)) != 0 {
+            NSLog("[Network] [\(label)] IP_BOUND_IF 失败 errno=\(errno)")
+        } else {
+            NSLog("[Network] [\(label)] socket 已钉到 \(name)（index \(idx)）")
+        }
     }
 
     /// 【保留但已不再作为主要手段】广播 DISCOVER_QUERY 到 255.255.255.255:50002。
@@ -445,6 +491,8 @@ final class NetworkController: NSObject, ObservableObject {
         var sndBuf: Int32 = 262_144
         setsockopt(aFd, SOL_SOCKET, SO_SNDBUF, &sndBuf,
                    socklen_t(MemoryLayout<Int32>.size))
+        // ★ 钉到 Wi-Fi：音频流走蜂窝/VPN 就全完了
+        pinToWiFi(aFd, label: "音频")
         audioFd = aFd
         log("音频通道就绪 → \(device.ip):\(device.port)")
 
@@ -488,6 +536,8 @@ final class NetworkController: NSObject, ObservableObject {
         tv.tv_usec = 200_000
         setsockopt(cFd, SOL_SOCKET, SO_RCVTIMEO, &tv,
                    socklen_t(MemoryLayout<timeval>.size))
+        // ★ 钉到 Wi-Fi：控制面也要防 VPN
+        pinToWiFi(cFd, label: "控制")
         ctrlFd = cFd
         log("控制通道就绪 → \(device.ip):\(device.controlPort)")
 
@@ -557,6 +607,9 @@ final class NetworkController: NSObject, ObservableObject {
             tv.tv_usec = 300_000
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv,
                        socklen_t(MemoryLayout<timeval>.size))
+
+            // ★ 钉到 Wi-Fi：探路结果才代表真实链路
+            self.pinToWiFi(fd, label: "探路")
 
             // 必须 bind —— 没端口就收不到回包
             var bindAddr = sockaddr_in()
