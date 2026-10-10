@@ -283,7 +283,7 @@ final class NetworkController: NSObject, ObservableObject {
 
     /// 解析手机当前的 IPv4 地址（确定扫描网段用）
     private func resolveLocalIP() {
-        let (wifi, cellular, all) = Self.interfaceSummary()
+        let (wifi, cellular, all) = interfaceSummary()
 
         // ★ 第二十七轮：把「手机到底连着什么网」明明白白打进日志。
         //
