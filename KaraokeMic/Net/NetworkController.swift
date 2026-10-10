@@ -850,13 +850,12 @@ final class NetworkController: NSObject, ObservableObject {
 
         if pinned {
             let name = wifiIface.isEmpty ? "en0" : wifiIface
-            if let idx = if_nametoindex(name), idx > 0 {
-                var index = idx
-                setsockopt(fd, IPPROTO_IP, Int32(25), &index,
-                           socklen_t(MemoryLayout<UInt32>.size))
-            } else {
-                return "\(label)：找不到接口 \(name)（if_nametoindex 失败）"
+            guard Darwin.if_nametoindex(name) > 0 else {
+                return "\(label)：找不到接口 \(name)（if_nametoindex 返回 0）"
             }
+            var index = Darwin.if_nametoindex(name)
+            setsockopt(fd, IPPROTO_IP, Int32(25), &index,
+                       socklen_t(MemoryLayout<UInt32>.size))
         }
 
         let payload = ControlFrameBuilder.build(
