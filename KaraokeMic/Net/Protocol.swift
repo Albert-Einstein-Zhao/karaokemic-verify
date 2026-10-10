@@ -97,6 +97,21 @@ struct ControlMessage: Codable {
     var ts: UInt64?
     var data: [String: JSONValue]?
 
+    // ★ 第二十五轮：兼容盒子端的「扁平」discover_reply。
+    //
+    // 【背景】盒子端旧版把 name/ip/port 直接放在 JSON 顶层，
+    //   而 iOS 端只读 data 嵌套 —— 于是收到回复却被当成无效包丢弃，
+    //   表现就是用户点「扫描」永远没反应。
+    //
+    // 【处理】盒子端已改成「顶层 + data 双写」，这里再补顶层字段的可选解析，
+    //   两种格式都能吃下，避免以后任何一端再改格式时又一次静默失效。
+    //   全部可选，不影响现有编解码。
+    var name: String?
+    var ip: String?
+    var port: Float?
+    var ctrlPort: Float?
+    var appVersion: String?
+
     init(cmd: String, id: Int? = nil, data: [String: JSONValue]? = nil) {
         self.cmd = cmd
         self.id = id

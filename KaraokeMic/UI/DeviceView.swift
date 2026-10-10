@@ -23,6 +23,7 @@ struct DeviceView: View {
                     }
 
                     manualEntry
+                    connectLogCard
                     diagnosticsCard
                 }
                 .padding(.horizontal, 20)
@@ -92,7 +93,7 @@ struct DeviceView: View {
 
     private var deviceList: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
+            HStack(spacing: 10) {
                 Text("发现的设备")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.white.opacity(0.6))
@@ -100,6 +101,14 @@ struct DeviceView: View {
                 Text("\(app.network.discoveredDevices.count) 台")
                     .font(KaraokeTheme.monoFont(11))
                     .foregroundStyle(.white.opacity(0.4))
+                Button {
+                    app.network.startDiscovery()
+                } label: {
+                    Text("重新扫描")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(KaraokeTheme.accentCyan)
+                }
+                .buttonStyle(.plain)
             }
 
             ForEach(app.network.discoveredDevices) { device in
@@ -150,6 +159,7 @@ struct DeviceView: View {
                             }
                     }
                 }
+                .contentShape(Rectangle())
                 .buttonStyle(.plain)
             }
         }
@@ -207,6 +217,42 @@ struct DeviceView: View {
             }
         }
         .glassCard()
+    }
+
+    // MARK: - 连接日志（现场定位卡在哪一步）
+
+    /// 把连接过程每一步实时显示出来。
+    /// 之前「点了没反应」完全无法定位，只能靠猜；
+    /// 现在卡在「音频通道就绪」还是「已发送 hello」一眼可见。
+    private var connectLogCard: some View {
+        Group {
+            if !app.network.connectLog.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("连接日志")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.6))
+                        Spacer()
+                        Text("最近 \(app.network.connectLog.count) 条")
+                            .font(KaraokeTheme.monoFont(11))
+                            .foregroundStyle(.white.opacity(0.4))
+                    }
+
+                    ForEach(Array(app.network.connectLog.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(KaraokeTheme.monoFont(11))
+                            .foregroundStyle(line.hasPrefix("❌")
+                                             ? KaraokeTheme.danger
+                                             : (line.hasPrefix("✅")
+                                                ? KaraokeTheme.success
+                                                : .white.opacity(0.75)))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .glassCard()
+            }
+        }
     }
 
     // MARK: - 诊断卡

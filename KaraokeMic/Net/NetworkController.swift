@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import Darwin
 import Network
 import UIKit
 
@@ -72,9 +73,20 @@ final class NetworkController: NSObject, ObservableObject {
 
     // MARK: - 私有状态
 
-    private var audioConnection: NWConnection?
-    private var controlConnection: NWConnection?
-    private var discoveryListener: NWListener?
+    // ── 连接通道 ────────────────────────────────────────────────────
+    // ★ 第二十五轮：连接层从 NWConnection 换成裸 BSD UDP socket。
+    //
+    // 【为什么换】发现（扫描）一直用的是裸 BSD socket，实测手机↔盒子双向通
+    //   （盒子日志显示收到手机查询并回复）。但连接用的是 NWConnection ——
+    //   它在 iOS 上访问局域网要「本地网络」授权，个人签名包（爱思+Apple ID）
+    //   常卡在 .waiting：既不 ready 也不 failed，UI 上就是「点了完全没反应」。
+    //   两套机制行为不一致是本次故障的根源，统一成裸 socket 后彻底消除。
+    //
+    //   UDP 的 connect() 不发任何握手包，只是给 socket 设默认目的地址，
+    //   之后 send/recv 都不用再填地址 —— 语义上正是我们想要的「一对一对端」。
+    private var audioFd: Int32 = -1        // 音频面：只发（实时线程用）
+    private var ctrlFd: Int32 = -1         // 控制面：收发
+    private var controlRunning = false     // 控制接收循环开关
     private let networkQueue = DispatchQueue(label: "com.xuebao.karamic.net", qos: .userInitiated)
 
     private var sequence: UInt32 = 0
@@ -85,6 +97,17 @@ final class NetworkController: NSObject, ObservableObject {
 
     private var currentDevice: DiscoveredDevice?
     private var pendingHelloAck = false
+
+    /// 连接超时定时器（4 秒没 ready 就明确报错，绝不静默卡住）
+    private var helloTimer: DispatchWorkItem?
+
+    /// 实时音频线程专用的发送计数。
+    /// ⚠️ 不能直接写 @Published packetsSent：那会每 5ms 触发一次 UI 重算，
+    ///    界面会卡成幻灯片。由主线程 ping 定时器每 500ms 同步一次。
+    private var sentPacketCount: Int = 0
+
+    /// 连接过程日志（UI 可见）—— 「卡在哪一步」现场定位的唯一手段。
+    @Published private(set) var connectLog: [String] = []
 
     /// 音频发送统计（本端）
     private var sentSeqSet: Set<UInt32> = []
@@ -128,14 +151,23 @@ final class NetworkController: NSObject, ObservableObject {
         scanning = true
 
         resolveLocalIP()
-        scanSubnet()
+        // ★ 第二十五轮：scanSubnet 内部是「发 254 个包 + 阻塞 recvfrom 等 2 秒」，
+        //   之前直接在调用方线程同步执行，而 DeviceView.onAppear 是在**主线程**
+        //   调它的 → 进设备页时界面整块卡住约 2 秒，用户反馈「点设备有点慢」。
+        //
+        //   挪到后台队列：主线程立刻返回，页面秒开；
+        //   扫描结果由 handleDiscoveryReply 内部 DispatchQueue.main.async 回主线程刷新，
+        //   所以这里是安全的（已确认 scanSubnet 内没有直接改 @Published 状态）。
+        networkQueue.async { [weak self] in
+            self?.scanSubnet()
+        }
     }
 
     /// 停止扫描。
     func stopDiscovery() {
+        // 广播监听（NWListener）已在第二十五轮整体删除 —— 个人签名拿不到
+        // multicast entitlement，那条路是死的，这里只需停掉后台重扫即可。
         scanning = false
-        discoveryListener?.cancel()
-        discoveryListener = nil
         if case .discovering = state { state = .idle }
     }
 
@@ -221,6 +253,17 @@ final class NetworkController: NSObject, ObservableObject {
 
         NSLog("[Discovery] 扫描结束，本次收到 \(found) 个回复（累计 \(discoveredDevices.count) 个盒子）")
 
+        // ★ 扫描结束必须把状态从 .discovering 复位。
+        //   否则 state 永远停在 .discovering，而 UI 的「重新扫描」按钮
+        //   只在 state != .discovering 时才显示 → 用户看到的就是
+        //   「点重新扫描也没用」。已连接状态不能被误复位，故只动 .discovering。
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if case .discovering = self.state {
+                self.state = .idle
+            }
+        }
+
         // ── ③ 15 秒后再扫一轮：盒子后开的、或者换了 IP 的都能跟上 ──
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) { [weak self] in
             guard let self, self.scanning else { return }
@@ -263,68 +306,30 @@ final class NetworkController: NSObject, ObservableObject {
     /// iOS 发出广播不需要权限（收才需要），所以这个包能出去，
     /// 但**收不到回复** —— 收回复需要 multicast entitlement。
     /// 保留它只是为了让局域网内其他类型的客户端仍能发现我们。
-    private func broadcastDiscoverQuery() {
-        guard let conn = try? NWConnection(
-            host: NWEndpoint.Host("255.255.255.255"),
-            port: NWEndpoint.Port(rawValue: KaraokeProtocol.discoveryPort)!,
-            using: .udp
-        ) else { return }
-
-        conn.start(queue: networkQueue)
-
-        var header = PacketHeader()
-        header.type = .discoverQuery
-        header.payloadLength = 0
-
-        conn.send(content: header.serialize(), completion: .contentProcessed { _ in
-            conn.cancel()
-        })
-    }
-
-    /// 监听 DISCOVER_REPLY。
-    private func startDiscoveryListener() {
-        do {
-            let listener = try NWListener(
-                using: .udp,
-                on: NWEndpoint.Port(rawValue: KaraokeProtocol.discoveryPort)!
-            )
-
-            listener.newConnectionHandler = { [weak self] conn in
-                conn.start(queue: self?.networkQueue ?? DispatchQueue.global())
-
-                conn.receiveMessage { [weak self] data, _, _, _ in
-                    guard let self, let data,
-                          let (header, message) = ControlFrameBuilder.parse(data),
-                          header.type == .discoverReply,
-                          let msg = message else { return }
-
-                    self.handleDiscoveryReply(msg)
-                }
-            }
-
-            listener.start(queue: networkQueue)
-            discoveryListener = listener
-
-            // 周期性重发广播（盒子的广播可能错过）
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                guard let self, case .discovering = self.state else { return }
-                self.broadcastDiscoverQuery()
-                self.startDiscoveryListener()
-            }
-
-        } catch {
-            NSLog("[NetworkController] 发现监听失败: \(error)")
-        }
-    }
-
     private func handleDiscoveryReply(_ message: ControlMessage) {
-        guard let data = message.data,
-              let ip = data["ip"]?.stringValue,
-              let name = data["name"]?.stringValue else { return }
+        // ★ 第二十五轮：同时兼容「data 嵌套」和「顶层扁平」两种结构。
+        //
+        // 【为什么要兼容】盒子端旧版把 name/ip/port 放在 JSON 顶层，
+        //   这里原来只读 message.data → 收到回复也被 guard 挡掉 return，
+        //   设备列表永远是空的，用户看到的就是「点扫描没反应」。
+        //   盒子端现已改成双写，这里再加一层兜底，任何一端再改格式都不会静默失效。
+        let dict = message.data
 
-        let port = UInt16(data["port"]?.floatValue ?? Float(KaraokeProtocol.audioPort))
-        let ctrlPort = UInt16(data["ctrlPort"]?.floatValue ?? Float(KaraokeProtocol.controlPort))
-        let version = data["appVersion"]?.stringValue ?? "?"
+        let rawIP = dict?["ip"]?.stringValue ?? message.ip
+        let rawName = dict?["name"]?.stringValue ?? message.name
+
+        guard let ip = rawIP, let name = rawName else { return }
+
+        let portValue = dict?["port"]?.floatValue
+            ?? message.port
+            ?? Float(KaraokeProtocol.audioPort)
+        let ctrlValue = dict?["ctrlPort"]?.floatValue
+            ?? message.ctrlPort
+            ?? Float(KaraokeProtocol.controlPort)
+        let version = dict?["appVersion"]?.stringValue ?? message.appVersion ?? "?"
+
+        let port = UInt16(portValue)
+        let ctrlPort = UInt16(ctrlValue)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -353,70 +358,127 @@ final class NetworkController: NSObject, ObservableObject {
         disconnect()
 
         currentDevice = device
-        state = .connecting
+        connectLog.removeAll()
+        log("开始连接 \(device.name)  \(device.ip)")
 
-        // ── 1. 建立音频连接（单向高频） ──
-        let audioPort = NWEndpoint.Port(rawValue: device.port)!
-        guard let audioConn = try? NWConnection(
-            host: NWEndpoint.Host(device.ip),
-            port: audioPort,
-            using: .udp
-        ) else {
-            state = .failed("无法创建音频连接")
+        // ── 1. 音频面 socket（只发，实时线程用）──────────────────────
+        let aFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard aFd >= 0 else {
+            state = .failed("创建音频 socket 失败")
             return
         }
+        var aAddr = sockaddr_in()
+        aAddr.sin_family = sa_family_t(AF_INET)
+        aAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        aAddr.sin_port = device.port.bigEndian
+        aAddr.sin_addr.s_addr = inet_addr(device.ip)
 
-        audioConnection = audioConn
-        audioConn.stateUpdateHandler = { [weak self] connState in
-            switch connState {
-            case .ready:
-                self?.handleAudioConnectionReady()
-            case .failed(let error):
-                DispatchQueue.main.async {
-                    self?.state = .failed(error.localizedDescription)
-                }
-            default:
-                break
+        let aOk = withUnsafePointer(to: &aAddr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(aFd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        audioConn.start(queue: networkQueue)
-
-        // ── 2. 建立控制连接（双向） ──
-        let ctrlPort = NWEndpoint.Port(rawValue: device.controlPort)!
-        guard let ctrlConn = try? NWConnection(
-            host: NWEndpoint.Host(device.ip),
-            port: ctrlPort,
-            using: .udp
-        ) else {
-            state = .failed("无法创建控制连接")
+        guard aOk == 0 else {
+            log("❌ 连音频端口失败 errno=\(errno)")
+            close(aFd)
+            state = .failed("无法连到 \(device.ip):\(device.port)")
             return
         }
+        // 实时音频线程里调 send，绝不能阻塞 → 设为非阻塞
+        _ = fcntl(aFd, F_SETFL, fcntl(aFd, F_GETFL, 0) | O_NONBLOCK)
+        var sndBuf: Int32 = 262_144
+        setsockopt(aFd, SOL_SOCKET, SO_SNDBUF, &sndBuf,
+                   socklen_t(MemoryLayout<Int32>.size))
+        audioFd = aFd
+        log("音频通道就绪 → \(device.ip):\(device.port)")
 
-        controlConnection = ctrlConn
+        // ── 2. 控制面 socket（收发）──────────────────────────────────
+        let cFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard cFd >= 0 else {
+            close(aFd); audioFd = -1
+            state = .failed("创建控制 socket 失败")
+            return
+        }
+        var cAddr = sockaddr_in()
+        cAddr.sin_family = sa_family_t(AF_INET)
+        cAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        cAddr.sin_port = device.controlPort.bigEndian
+        cAddr.sin_addr.s_addr = inet_addr(device.ip)
+
+        let cOk = withUnsafePointer(to: &cAddr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(cFd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard cOk == 0 else {
+            log("❌ 连控制端口失败 errno=\(errno)")
+            close(cFd); close(aFd); audioFd = -1
+            state = .failed("无法连到 \(device.ip):\(device.controlPort)")
+            return
+        }
+        // 读超时 200ms —— 让接收循环能感知「该退出了」，而不是永久卡在 recv
+        var tv = timeval()
+        tv.tv_sec = 0
+        tv.tv_usec = 200_000
+        setsockopt(cFd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                   socklen_t(MemoryLayout<timeval>.size))
+        ctrlFd = cFd
+        log("控制通道就绪 → \(device.ip):\(device.controlPort)")
+
+        state = .handshaking
         pendingHelloAck = true
 
-        ctrlConn.stateUpdateHandler = { [weak self] connState in
-            switch connState {
-            case .ready:
-                self?.sendHello()
-                // 启动控制面接收循环
-                self?.receiveControlLoop(on: ctrlConn)
-            case .failed(let error):
-                DispatchQueue.main.async {
-                    self?.state = .failed(error.localizedDescription)
-                }
-            default:
-                break
+        // ── 3. 启动控制面接收循环 ────────────────────────────────────
+        startControlReceiveLoop()
+
+        // ── 4. 发 hello（两个 socket 都已就绪，不会像旧版那样把包丢掉）──
+        sendHello()
+        log("已发送 hello，等待盒子回应…")
+
+        // ── 5. 超时兜底：4 秒没 ready 就明确报错 ──────────────────────
+        helloTimer?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if !self.state.isConnected {
+                self.log("❌ 4 秒内没收到盒子回应")
+                self.state = .failed("盒子无响应：请确认盒子 App 已打开、且手机与盒子在同一 Wi-Fi")
             }
         }
-        ctrlConn.start(queue: networkQueue)
+        helloTimer = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: item)
     }
 
-    private func handleAudioConnectionReady() {
-        DispatchQueue.main.async { [weak self] in
-            self?.state = .handshaking
+    /// 控制面接收循环（后台线程：阻塞 recv + 200ms 超时轮询）。
+    private func startControlReceiveLoop() {
+        controlRunning = true
+        networkQueue.async { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while true {
+                guard let self, self.controlRunning, self.ctrlFd >= 0 else { break }
+                let n = recv(self.ctrlFd, &buf, buf.count, 0)
+                if n > 0 {
+                    let data = Data(buf[0..<n])
+                    self.handleControlPacket(data)
+                } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                    continue            // 200ms 读超时，正常继续
+                } else if errno == EBADF {
+                    break               // fd 已被关闭
+                } else {
+                    usleep(20_000)      // 未知错误：让出 CPU，避免忙等烧电
+                }
+            }
+            NSLog("[NetworkController] 控制接收循环退出")
         }
-        sendHello()
+    }
+
+    /// 写一行连接日志（UI 可见 + NSLog 双写）。
+    private func log(_ text: String) {
+        NSLog("[Connect] \(text)")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.connectLog.append(text)
+            if self.connectLog.count > 12 { self.connectLog.removeFirst() }
+        }
     }
 
     private func sendHello() {
@@ -428,21 +490,6 @@ final class NetworkController: NSObject, ObservableObject {
             "frameMs": .number(20)
         ])
         sendControl(msg)
-    }
-
-    /// 控制面接收循环（递归）。
-    private func receiveControlLoop(on conn: NWConnection) {
-        conn.receiveMessage { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-
-            if let data {
-                self.handleControlPacket(data)
-            }
-
-            if !isComplete, error == nil {
-                self.receiveControlLoop(on: conn)
-            }
-        }
     }
 
     private func handleControlPacket(_ data: Data) {
@@ -468,6 +515,7 @@ final class NetworkController: NSObject, ObservableObject {
         switch msg.cmd {
         case ControlMessage.ControlCmd.helloAck:
             // 协商完成 → 开始发音频
+            self.log("收到 hello_ack，请求盒子开始接收")
             let bufferMs = msg.data?["bufferMs"]?.floatValue ?? 40
             DispatchQueue.main.async {
                 self.bufferFillMs = bufferMs
@@ -476,8 +524,10 @@ final class NetworkController: NSObject, ObservableObject {
 
         case ControlMessage.ControlCmd.ready:
             // 盒子已预填充缓冲，可以正式开始
+            self.log("✅ 盒子已就绪，开始传送人声")
             DispatchQueue.main.async {
                 self.state = .ready
+                self.scanning = false      // 已连上，停掉 15 秒一轮的后台重扫
                 self.startPingTimer()
             }
             // 重置序列号统计
@@ -512,21 +562,19 @@ final class NetworkController: NSObject, ObservableObject {
     ///    所以不能做重活（不能加锁等待、不能 print、不能 JSON 编码）。
     ///    NWConnection.send 是非阻塞的，符合要求。
     func sendAudioFrame(samples: [Float], sampleRate: UInt32 = 48000) {
-        guard let conn = audioConnection, state == .ready else { return }
+        guard audioFd >= 0, state == .ready else { return }
 
         let packet = AudioFrameBuilder.build(
             from: samples, seq: sequence, sampleRate: sampleRate
         )
 
-        conn.send(content: packet, completion: .contentProcessed { [weak self] error in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if error == nil {
-                    self.packetsSent += 1
-                }
-            }
-        })
-
+        // ⚠️ 实时音频线程：这里只允许有一次 send 系统调用。
+        //    不能碰 @Published、不能 DispatchQueue.main、不能加锁等待，
+        //    否则 UI 每 5ms 被唤醒一次，界面会卡成幻灯片。
+        let n = packet.withUnsafeBytes { raw -> Int in
+            send(audioFd, raw.baseAddress, raw.count, 0)
+        }
+        if n > 0 { sentPacketCount &+= 1 }
         sequence &+= 1
     }
 
@@ -550,12 +598,12 @@ final class NetworkController: NSObject, ObservableObject {
         if pingSentAt.count > 10 { pingSentAt.removeFirst() }
 
         let msg = ControlMessage(cmd: "ping", data: [
-            // ★ JSONValue.number 是 Float：UInt64 直接放 Double 会编译错
-            //   （CI 首次编译抓出）。& 0xFFFFFFFF 后转 Float 尾数足够
-            //   （我们只要求盒子原样回显，RTT 用本地的 t0 计算）。
             "t0": .number(Float(t0 & 0xFFFFFFFF))
         ])
         sendControl(msg)
+
+        // 把实时线程累加的计数同步给 UI（主线程，每 500ms 一次，不会卡）
+        packetsSent = sentPacketCount
     }
 
     private func handlePong(_ data: Data) {
@@ -576,13 +624,17 @@ final class NetworkController: NSObject, ObservableObject {
     // MARK: - 控制发送
 
     private func sendControl(_ message: ControlMessage) {
-        guard let conn = controlConnection else { return }
+        guard ctrlFd >= 0 else {
+            NSLog("[NetworkController] 控制 socket 未建立，丢弃 cmd=\(message.cmd)")
+            return
+        }
         let data = ControlFrameBuilder.build(message)
-        conn.send(content: data, completion: .contentProcessed { error in
-            if let error {
-                NSLog("[NetworkController] 控制发送失败: \(error)")
-            }
-        })
+        let n = data.withUnsafeBytes { raw -> Int in
+            send(ctrlFd, raw.baseAddress, raw.count, 0)
+        }
+        if n < 0 {
+            NSLog("[NetworkController] 控制发送失败 cmd=\(message.cmd) errno=\(errno)")
+        }
     }
 
     /// 设置盒子端音量（0~1）。只影响我们的音频轨，不影响盒子其他 App。
@@ -618,16 +670,24 @@ final class NetworkController: NSObject, ObservableObject {
     func disconnect() {
         pingTimer?.invalidate()
         pingTimer = nil
+        helloTimer?.cancel()
+        helloTimer = nil
 
-        sendControl(ControlMessage(cmd: ControlMessage.ControlCmd.bye))
+        // 礼貌告别（此时 ctrlFd 还有效）
+        if ctrlFd >= 0 {
+            sendControl(ControlMessage(cmd: ControlMessage.ControlCmd.bye))
+        }
 
-        audioConnection?.cancel()
-        controlConnection?.cancel()
-        discoveryListener?.cancel()
+        controlRunning = false
+        if audioFd >= 0 { close(audioFd); audioFd = -1 }
 
-        audioConnection = nil
-        controlConnection = nil
-        discoveryListener = nil
+        // 控制 fd 要等接收线程退出后再关，否则 recv 会用到已关闭的 fd
+        let dying = ctrlFd
+        ctrlFd = -1
+        if dying >= 0 {
+            networkQueue.asyncAfter(deadline: .now() + 0.3) { close(dying) }
+        }
+
         currentDevice = nil
         sequence = 0
         state = .idle
@@ -650,42 +710,5 @@ final class NetworkController: NSObject, ObservableObject {
         connect(to: device)
     }
 
-    /// IP 段扫描兜底。
-    func scanIPRange(basePrefix: String = "192.168.1") {
-        networkQueue.async { [weak self] in
-            guard let self else { return }
 
-            for host in 1...254 {
-                let ip = "\(basePrefix).\(host)"
-                let port = NWEndpoint.Port(rawValue: KaraokeProtocol.audioPort)!
-
-                guard let probe = try? NWConnection(
-                    host: NWEndpoint.Host(ip), port: port, using: .udp
-                ) else { continue }
-
-                probe.start(queue: self.networkQueue)
-                probe.stateUpdateHandler = { connState in
-                    if case .ready = connState {
-                        // 端口有响应 → 尝试当盒子
-                        DispatchQueue.main.async {
-                            let device = DiscoveredDevice(
-                                id: "\(ip):\(KaraokeProtocol.audioPort)",
-                                name: "扫描到 \(ip)",
-                                ip: ip,
-                                port: KaraokeProtocol.audioPort,
-                                controlPort: KaraokeProtocol.controlPort,
-                                appVersion: "?",
-                                lastSeen: Date(),
-                                rttMs: nil
-                            )
-                            if !self.discoveredDevices.contains(where: { $0.id == device.id }) {
-                                self.discoveredDevices.append(device)
-                            }
-                        }
-                    }
-                    probe.cancel()
-                }
-            }
-        }
-    }
 }
