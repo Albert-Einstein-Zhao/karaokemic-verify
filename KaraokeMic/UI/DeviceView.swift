@@ -169,6 +169,23 @@ struct DeviceView: View {
 
     // MARK: - 手动输入
 
+    /// 正在握手/连接中（用于按钮转圈与防重复点击）。
+    /// ConnectionState 是 Equatable 且这几个 case 无关联值，直接 == 比较安全。
+    private var isManualConnecting: Bool {
+        app.network.state == .connecting || app.network.state == .handshaking
+    }
+
+    /// 按压反馈：按下去轻微缩小 + 变暗，松手弹回。
+    /// 之前用 .plain 完全无视觉反馈，用户「不知道自己按没按」。
+    private struct PressScaleButtonStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+                .opacity(configuration.isPressed ? 0.7 : 1.0)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+        }
+    }
+
     private var manualEntry: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -199,20 +216,33 @@ struct DeviceView: View {
                         }
                         .foregroundStyle(.white)
 
-                    Button("连接") {
+                    Button {
                         let ip = manualIP.trimmingCharacters(in: .whitespaces)
                         guard !ip.isEmpty else { return }
                         app.network.connectManually(ip: ip)
+                    } label: {
+                        HStack(spacing: 8) {
+                            if isManualConnecting {
+                                ProgressView()
+                                    .tint(.white)
+                                Text("连接中…")
+                            } else {
+                                Text("连接")
+                            }
+                        }
+                        .font(.system(size: 14, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background {
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(isManualConnecting
+                                      ? AnyShapeStyle(Color.white.opacity(0.15))
+                                      : AnyShapeStyle(KaraokeTheme.accentGradient))
+                        }
+                        .foregroundStyle(.white)
                     }
-                    .font(.system(size: 14, weight: .medium))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background {
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(KaraokeTheme.accentGradient)
-                    }
-                    .foregroundStyle(.white)
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressScaleButtonStyle())
+                    .disabled(isManualConnecting)
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }

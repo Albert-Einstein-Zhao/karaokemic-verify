@@ -691,7 +691,7 @@ final class NetworkController: NSObject, ObservableObject {
             guard let self else { return }
             if !self.state.isConnected {
                 self.log("❌ 8 秒内没收到盒子回应（已重发 3 次）")
-                self.state = .failed("盒子无响应：请确认盒子 App 已打开、且手机与盒子在同一 Wi-Fi")
+                self.state = .failed("连不上盒子：①设置→隐私与安全性→本地网络→打开「K歌麦」（最常见原因，被拒后不会再弹框）；②确认盒子 App 已打开、手机与盒子在同一 Wi-Fi")
             }
         }
         helloTimer = item
@@ -986,7 +986,13 @@ final class NetworkController: NSObject, ObservableObject {
         case EACCES:  return "EACCES 权限不足 —— 请检查「本地网络」权限"
         case ENETDOWN: return "ENETDOWN 网络不可用 —— Wi-Fi 是否断开？"
         case ENETUNREACH: return "ENETUNREACH 网络不可达 —— 手机和盒子不在同一网段"
-        case EHOSTUNREACH: return "EHOSTUNREACH 主机不可达 —— 盒子 IP 是否变了？"
+        case EHOSTUNREACH:
+            // ★ 第三十轮实测教训：盒子在线、ping 全通的情况下仍报此错，
+            //   十有八九是「本地网络」权限被拒 —— iOS 拦截局域网包时
+            //   返回的正是 EHOSTUNREACH(65)，且**永远不会再弹第二次授权框**。
+            //   （PC 探针 probe_hello.py 实测盒子 50001 秒回 hello_ack，
+            //    同一时刻 App 里却 sendto 失败 —— 只有权限拦得出来这种矛盾。）
+            return "EHOSTUNREACH 被系统拦了 —— ①设置→隐私与安全性→本地网络→打开「K歌麦」（最常见）；②盒子是否在线（换个设备 ping 192.168.1.10）"
         case ENOTCONN: return "ENOTCONN socket 未连接（sendto 姿势下不应出现）"
         case EADDRNOTAVAIL: return "EADDRNOTAVAIL 地址不可用 —— IP 填写有误？"
         case EAFNOSUPPORT: return "EAFNOSUPPORT 地址族不支持"
