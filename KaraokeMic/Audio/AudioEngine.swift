@@ -116,8 +116,11 @@ final class AudioEngineController {
             .mixWithOthers          // 允许与音乐 App 混音
         ])
 
-        // 期望时长 .playAndRecord = 10ms，这是 iOS 能给的最小值
-        try session.setPreferredIOBufferDuration(0.010)
+        // 采集 IO 缓冲：从 10ms 降到 6ms（第三十二轮降延迟）。
+        // iOS 会按硬件下限收敛（playAndRecord 实际地板约 5.3ms），
+        // 给 6ms 既能压低采集延迟，又比 10ms 更稳。
+        // 附带好处：tap 回调更碎 → 单帧分片更少 → 发送分摊延迟也变小。
+        try session.setPreferredIOBufferDuration(0.006)
         try session.setPreferredSampleRate(sampleRate)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
     }
