@@ -582,12 +582,9 @@ final class NetworkController: NSObject, ObservableObject {
         log("手机网络：\(ifaceSummary)")
 
         // ── 0. 发送姿势体检（穷举，穷举出到底哪种姿势能发）────────────
-        probeTransportMatrix(to: device.ip)
-        //   用「扫描同款」的 discover_query 打 50002。这一步的成功/失败
-        //   能干净地把故障切成两半：
-        //     · 探路成功 + hello 无回音 → 网络没问题，是协议/端口的问题
-        //     · 探路也失败            → 手机根本发不出 UDP，别再怀疑盒子
-        probeReachability(to: device.ip)
+        // （已移除 UDP 探路/体检矩阵调用：这些是为排查一个并不存在的网络问题
+        //   而加的噪音，现在不调用，UI 上的「体检卡」也不再出现。）
+        //   盒子端在收到 hello 后回 hello_ack 即代表握手成功，无需任何探路。
 
         // ── 1. 音频面 socket（只发，实时线程用）──────────────────────
         let aFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -1054,20 +1051,29 @@ final class NetworkController: NSObject, ObservableObject {
 
         switch msg.cmd {
         case ControlMessage.ControlCmd.helloAck:
-            // 协商完成 → 开始发音频
-            self.log("收到 hello_ack，请求盒子开始接收")
+            // ★★★ 握手成功（与验证版一致：2026-10-09 实测能出声的写法）★★★
+            //
+            // 盒子端**只在收到 hello 时回 hello_ack**，从不发 `ready`
+            // （见 ReceiverService.handleControlMessage，控制消息只有
+            //  hello / start_audio / bye / set_volume / set_mute / ping）。
+            //  盒子真正启动播放是在收到**首个音频包**时（onFirstAudioPacket），
+            //  所以根本不存在「盒子回 ready」这回事。
+            //
+            // 上一版在这里多写了一步：发 start_audio 之后去等盒子回 `ready`
+            // 才 setConnected() —— 而盒子永不回 ready，于是 iOS 永远停在
+            //  .handshaking，8 秒后报「盒子无响应」。这正是「连不上」的根因。
+            //
+            // 正确做法（与验证版逐字一致）：收到 hello_ack 即代表盒子确认在线，
+            // 立刻进入 ready，AudioEngine 才会开始发音频包。
+            self.log("收到 hello_ack，盒子确认在线，开始传送人声")
             let bufferMs = msg.data?["bufferMs"]?.floatValue ?? 40
             DispatchQueue.main.async {
                 self.bufferFillMs = bufferMs
             }
+            // 通知盒子我们要开始发音频（盒子收到只打日志，无害）
             sendControl(ControlMessage(cmd: ControlMessage.ControlCmd.startAudio, id: 2))
-
-        case ControlMessage.ControlCmd.ready:
-            // 盒子已预填充缓冲，可以正式开始
-            self.log("✅ 盒子已就绪，开始传送人声")
-            DispatchQueue.main.async {
-                self.setConnected()
-            }
+            // ★ 立刻置为已连接 —— 这是把声音传出去的关键一步
+            self.setConnected()
 
         case "error":
             let err = msg.data?["error"]?.stringValue ?? "unknown"
