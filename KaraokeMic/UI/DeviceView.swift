@@ -287,32 +287,6 @@ struct DeviceView: View {
         }
     }
 
-    // MARK: - UDP 发送姿势体检（第二十九轮）
-
-    /// 把每种发送姿势的真发结果直接摆出来，不再让用户隔着日志去猜。
-    private var transportCard: some View {
-        Group {
-            if !app.network.transportReport.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("UDP 发送姿势体检")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.6))
-
-                    ForEach(app.network.transportReport, id: \.self) { line in
-                        Text(line)
-                            .font(KaraokeTheme.monoFont(10))
-                            .foregroundStyle(line.contains("✅")
-                                             ? KaraokeTheme.success
-                                             : KaraokeTheme.danger)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .glassCard()
-            }
-        }
-    }
-
     // MARK: - 诊断卡
 
     private var diagnosticsCard: some View {
